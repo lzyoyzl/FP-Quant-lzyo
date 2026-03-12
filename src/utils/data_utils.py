@@ -1,3 +1,4 @@
+import os
 import random
 from typing import Optional, List
 
@@ -199,6 +200,103 @@ def get_tulu3_sft_mixture(
     return train_dataset
 
 
+def get_local_jsonl(
+    json_path: str,
+    tokenizer: AutoTokenizer,
+    max_sequence_length: int,
+    num_calibration_samples: Optional[int] = None,
+    seed: int = 42
+) -> List[torch.Tensor]:
+    """
+    Load a local .jsonl/.json file with {"text": "..."} per line and return
+    a list of (1, max_sequence_length) tensors for calibration.
+    Uses streaming to avoid loading the whole file into memory.
+    """
+    if num_calibration_samples is None:
+        raise ValueError("num_calibration_samples must be provided for local jsonl calibration.")
+
+    ds = load_dataset(
+        "json",
+        data_files=json_path,
+        split="train",
+        streaming=True,
+    )
+    # Shuffle for better diversity; buffer_size can be small because your file isn't huge
+    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+
+    trainloader: List[torch.Tensor] = []
+    for sample in ds:
+        text = sample.get("text", "")
+        if not text:
+            continue
+        trainenc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        if trainenc.input_ids.shape[1] < max_sequence_length:
+            continue
+        i = random.randint(0, trainenc.input_ids.shape[1] - max_sequence_length)
+        tokenized_sample = trainenc.input_ids[:, i:i + max_sequence_length]
+        trainloader.append(tokenized_sample)
+        if len(trainloader) >= num_calibration_samples:
+            break
+
+    if len(trainloader) < num_calibration_samples:
+        raise RuntimeError(
+            f"Not enough samples from local jsonl: got {len(trainloader)} < {num_calibration_samples}. "
+            f"File={json_path}"
+        )
+    return trainloader
+
+
+def get_local_tokens_pt(
+    pt_path: str,
+    tokenizer: AutoTokenizer,  # kept for signature consistency; not used
+    max_sequence_length: int,
+    num_calibration_samples: Optional[int] = None,
+    seed: int = 42
+) -> List[torch.Tensor]:
+    """
+    Load a local .pt file saved by your make_calib script:
+      torch.save({"input_ids": tensor[n, seq_len], ...}, pt_path)
+    and return a list of (1, max_sequence_length) tensors.
+    This is the most stable/fast path.
+    """
+    obj = torch.load(pt_path, map_location="cpu")
+    if isinstance(obj, dict) and "input_ids" in obj:
+        input_ids = obj["input_ids"]
+    else:
+        input_ids = obj
+
+    if not isinstance(input_ids, torch.Tensor):
+        raise ValueError(f"Unsupported .pt format: expected Tensor or dict with 'input_ids', got {type(input_ids)}")
+
+    if input_ids.dim() != 2:
+        raise ValueError(f"Expected input_ids shape [N, L], got {tuple(input_ids.shape)}")
+
+    N, L = input_ids.shape
+    if L < max_sequence_length:
+        raise ValueError(f"Sequence length in pt ({L}) < required ({max_sequence_length})")
+
+    # If pt has longer sequences, we take a random window per row.
+    # If exactly equal, we take as-is.
+    if num_calibration_samples is None:
+        num_calibration_samples = N
+    num_calibration_samples = min(num_calibration_samples, N)
+
+    # Ensure long dtype for models
+    input_ids = input_ids.to(dtype=torch.long)
+
+    trainloader: List[torch.Tensor] = []
+    for idx in range(num_calibration_samples):
+        row = input_ids[idx]
+        if L == max_sequence_length:
+            chunk = row
+        else:
+            start = random.randint(0, L - max_sequence_length)
+            chunk = row[start:start + max_sequence_length]
+        trainloader.append(chunk.unsqueeze(0))  # (1, seq_len)
+
+    return trainloader
+
+
 def get_data(
     dataset_name: str, 
     tokenizer: AutoTokenizer, 
@@ -206,6 +304,20 @@ def get_data(
     num_calibration_samples: Optional[int] = None,
     seed: int = 42
 ) -> List[torch.Tensor]:
+   
+    # ---- NEW: local file support (does not affect existing dataset names) ----
+    if os.path.isfile(dataset_name):
+        lower = dataset_name.lower()
+        if lower.endswith((".jsonl", ".json")):
+            return get_local_jsonl(dataset_name, tokenizer, max_sequence_length, num_calibration_samples, seed)
+        if lower.endswith(".pt"):
+            return get_local_tokens_pt(dataset_name, tokenizer, max_sequence_length, num_calibration_samples, seed)
+
+    # ---- NEW: allow full HF name alias for fineweb-edu ----
+    if dataset_name in ("fineweb-edu", "HuggingFaceFW/fineweb-edu"):
+        return get_fineweb_edu(tokenizer, max_sequence_length, num_calibration_samples, seed)
+
+
     if dataset_name == "open-thoughts":
         return get_open_thoughts(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "open-platypus":

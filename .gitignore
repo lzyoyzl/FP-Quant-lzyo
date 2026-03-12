@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+# ignore cache/results dirs under oyzl_test
+env_var.sh
+/oyzl_test/env_var.sh
+/oyzl_test/hf_home/
+/oyzl_test/results_quant/
+/oyzl_test/torch_home/
+/oyzl_test/xdg_cache/

@@ -1,0 +1,6 @@
+llama-2-7b-hf__mxfp_gptq_w4a4_hadamard_h128_mse_default
+llama-2-7b-hf__mxfp_mrgptq_w4a4_hadamard_h128_mse_activation
+Qwen3-8B__mxfp_gptq_w4a4_hadamard_h128_mse_default
+Qwen3-8B__mxfp_mrgptq_w4a4_hadamard_h128_mse_activation
+llama-3-8b-hf__mxfp_gptq_w4a4_hadamard_h128_mse_default
+llama-3-8b-hf__mxfp_mrgptq_w4a4_hadamard_h128_mse_activation
