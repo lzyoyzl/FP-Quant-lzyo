@@ -14,7 +14,10 @@ from .quantizer import Quantizer
 from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
 from .accumulate_hessian import accumulate_hessian
-from ..transforms.transforms import build_transform, get_transform_matrix
+# Original import kept for reference (requested).
+# from ..transforms.transforms import build_transform, get_transform_matrix
+from ..transforms.transforms import get_transform_matrices
+from .transform_search import build_block_input_transforms, format_transform_summary
 from ..utils.linalg_utils import inv_sym
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
 from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_layer, get_mlp_layer, get_number_of_rows_and_cols
@@ -288,11 +291,29 @@ def gptq_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
-        # 1. Init transforms
-        qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
-        o_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
-        gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
-        down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
+                # 1. Init transforms
+        # Original implementation kept for reference (requested).
+        # qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
+        # o_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
+        # gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
+        # down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)
+        # New path: optionally run per-group transform search to minimize quantization MSE.
+        qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform = build_block_input_transforms(
+            block=block,
+            hidden_size=model.config.hidden_size,
+            intermediate_size=model.config.intermediate_size,
+            args=args,
+            device=device,
+            transform_kwargs=transform_kwargs,
+            weight_quantizer_kwargs=weight_quantizer_kwargs,
+        )
+        if args.transform_search:
+            print(
+                f"  [transform_search] qkv={format_transform_summary(qkv_in_transform)} | "
+                f"o={format_transform_summary(o_in_transform)} | "
+                f"gate_up={format_transform_summary(gate_up_in_transform)} | "
+                f"down={format_transform_summary(down_in_transform)}"
+            )     
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(
@@ -407,6 +428,8 @@ def gptq_quantization(
                     layer.act_quantizer._track_global_scale = False
 
         # 7. Run GPTQ quantization
+        # Cache transform matrices so shared transforms are materialized only once per block.
+        transform_matrix_cache = {}
         for layer_name, gptq_handle in gptq_handles.items():
             dequantized_qweight, qweight, scales = gptq_handle.quantize()
             orig_weight = gptq_handle.layer.weight
@@ -422,14 +445,35 @@ def gptq_quantization(
                 weight_global_scale = gptq_handle.quantizer.global_scale.to(scales.device)
                 act_global_scale = gptq_handle.layer.act_quantizer.global_scale
 
-                transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
+                # Original implementation kept for reference (requested).
+                # transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
+                # New path: export matrices from the exact transform instance used by this layer.
+                if re.search("(q|k|v)_proj", layer_name):
+                    layer_transform = qkv_in_transform
+                elif re.search("o_proj", layer_name):
+                    layer_transform = o_in_transform
+                elif re.search("(gate|up)_proj", layer_name):
+                    layer_transform = gate_up_in_transform
+                else:
+                    layer_transform = down_in_transform
+
+                matrix_key = (id(layer_transform), gptq_handle.layer.weight.shape[-1])
+                if matrix_key not in transform_matrix_cache:
+                    forward_matrix, backward_matrix = get_transform_matrices(
+                        layer_transform,
+                        size=gptq_handle.layer.weight.shape[-1],
+                        device=gptq_handle.layer.weight.device,
+                        dtype=orig_dtype,
+                    )
+                    transform_matrix_cache[matrix_key] = (forward_matrix.cpu(), backward_matrix.cpu())
+                forward_transform_matrix, backward_transform_matrix = transform_matrix_cache[matrix_key]
 
                 if args.export_quantized_model == "realquant":
                     quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
                         "qweight": pack_fp4_to_uint8(qweight).cpu(),
                         "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
+                        "forward_hadamard_matrix": forward_transform_matrix.clone(),
+                        "backward_hadamard_matrix": backward_transform_matrix.clone(),
                         "weight_global_scale": weight_global_scale.clone(),
                         "act_global_scale": act_global_scale.clone()
                     }
@@ -437,8 +481,8 @@ def gptq_quantization(
                 else:
                     quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
                         "dqweight": dequantized_qweight.cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
+                        "forward_hadamard_matrix": forward_transform_matrix.clone(),
+                        "backward_hadamard_matrix": backward_transform_matrix.clone(),
                         "weight_global_scale": weight_global_scale.clone(),
                         "act_global_scale": act_global_scale.clone()
                     }
@@ -468,3 +512,4 @@ def gptq_quantization(
     clear_device_cache(garbage_collection=True)
 
     return quantized_state_dict, non_quantized_state_dict
+

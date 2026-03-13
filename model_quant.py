@@ -16,6 +16,7 @@ from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
+from src.quantization.transform_search import DEFAULT_SEARCH_TRANSFORMS, SUPPORTED_SEARCH_TRANSFORMS
 from src.utils.common_utils import fix_seed
 from src.utils.data_utils import get_data, get_wikitext2
 
@@ -243,11 +244,27 @@ def parse_args():
         choices=TRANSFORMS.keys(),
         help="The transform class."
     )
+    # Original malformed line kept for reference (requested):
+    #     parser.add_argument(
     parser.add_argument(
         "--hadamard_group_size",
         type=int,
         default=128,
         help="Hadamard group size"
+    )
+    # New: enable per-group transform search that minimizes quantization MSE.
+    parser.add_argument(
+        "--transform_search",
+        action="store_true",
+        help="Enable per-group transform search to minimize quantization MSE.",
+    )
+    # New: candidate transforms explored during group-wise search.
+    parser.add_argument(
+        "--transform_search_candidates",
+        nargs="+",
+        type=str,
+        default=DEFAULT_SEARCH_TRANSFORMS,
+        help="Candidate transform classes used by --transform_search.",
     )
     # Logging params
     parser.add_argument(
@@ -331,9 +348,37 @@ def parse_args():
         if args.scale_precision != "e8m0":
             args.scale_precision = "e8m0"
             print(f"Changed scale precision to e8m0 for mxfp format.")
-    # Check logging
+    # Original check logging line kept for reference (requested):
+    #     # Check logging
+    # Original malformed lines kept for reference (requested):
+    #     if args.log_wandb:
+    #     assert wandb is not None, "wandb is not installed. Please install wandb `pip install wandb`."
     if args.log_wandb:
         assert wandb is not None, "wandb is not installed. Please install wandb `pip install wandb`."
+
+    # New: validate transform-search specific constraints.
+    if args.transform_search:
+        assert args.w_bits < 16, "--transform_search requires weight quantization (w_bits < 16)."
+        assert args.w_granularity == "group", "--transform_search requires --w_granularity group."
+        assert args.w_group_size is not None, "--transform_search requires a valid --w_group_size."
+
+        # Deduplicate while preserving order so search behavior is deterministic.
+        dedup_candidates = []
+        seen_candidates = set()
+        for candidate in args.transform_search_candidates:
+            if candidate not in seen_candidates:
+                dedup_candidates.append(candidate)
+                seen_candidates.add(candidate)
+
+        invalid_candidates = [
+            candidate for candidate in dedup_candidates if candidate not in SUPPORTED_SEARCH_TRANSFORMS
+        ]
+        if invalid_candidates:
+            raise ValueError(
+                f"Invalid --transform_search_candidates: {invalid_candidates}. "
+                f"Supported: {sorted(SUPPORTED_SEARCH_TRANSFORMS)}"
+            )
+        args.transform_search_candidates = dedup_candidates
     # Check real_quant config
     if args.export_quantized_model:
         assert args.save_path is not None, "`save_path` must be specified when exporting quantized model."
@@ -480,3 +525,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

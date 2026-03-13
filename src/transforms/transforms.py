@@ -290,7 +290,31 @@ class GSRTransform(BaseTransform):
 
     def remove_parametrizations(self) -> None:
         pass
-        
+
+
+class HouseholderTransform(BaseTransform):
+
+    def __init__(self, group_size: int = 128):
+        super().__init__()
+        self.group_size = group_size
+        # Single reflection matrix H = I - 2 * vv^T / (v^Tv) used for each group.
+        v = torch.randn(group_size, dtype=torch.float32)
+        denom = torch.dot(v, v).clamp_min(1e-12)
+        self.block_householder = torch.eye(group_size, dtype=torch.float32) - 2.0 * torch.outer(v, v) / denom
+        self.mat = None
+
+    def forward(self, x: torch.Tensor, inv_t: bool = False, dim: int = -1):
+        # Householder reflection is orthogonal and self-inverse.
+        x_shape = x.shape
+        if self.mat is None:
+            self.mat = torch.block_diag(
+                *[self.block_householder] * (x_shape[-1] // self.group_size),
+            ).to(x.device).to(x.dtype)
+        return torch.matmul(x, self.mat)
+
+    def remove_parametrizations(self) -> None:
+        pass
+
 
 TRANSFORMS = {
     "identity": IdentityTransform,
@@ -301,7 +325,8 @@ TRANSFORMS = {
     "dct": DCTTransform,
     "dst": DSTransform,
     "fast_food": FastFoodTransform,
-    "gsr": GSRTransform
+    "gsr": GSRTransform,
+    "householder": HouseholderTransform
 }
 
 
@@ -309,15 +334,45 @@ def build_transform(transform_class: str, **transform_kwargs) -> BaseTransform:
     transform = TRANSFORMS[transform_class]
     return transform(**filter_kwarg_dict(transform.__init__, transform_kwargs))
 
+# Original implementation kept for reference (requested).
+# def get_transform_matrix(
+#     transform_class: str,
+#     size: int,
+#     device: torch.device = None,
+#     dtype: torch.dtype = None
+# ) -> torch.Tensor:
+#     if transform_class == "hadamard":
+#         return hadamard_transform(torch.eye(size, device=device, dtype=dtype), scale=1 / math.sqrt(size))
+#     elif transform_class == "identity":
+#         return torch.eye(size, device=device, dtype=dtype)
+#     else:
+#         raise NotImplementedError(f"get_transform_matrix is implemented only for Hadamard and Identity transforms")
+
+@torch.no_grad()
+def get_transform_matrices(
+    transform: BaseTransform,
+    size: int,
+    device: torch.device = None,
+    dtype: torch.dtype = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Materialize both forward and inverse-transpose forms from the transform instance.
+    eye = torch.eye(size, device=device, dtype=dtype)
+    forward_matrix = transform(eye, inv_t=False, dim=-1)
+    backward_matrix = transform(eye, inv_t=True, dim=-1)
+    return forward_matrix, backward_matrix
+
+
 def get_transform_matrix(
-    transform_class: str, 
-    size: int, 
-    device: torch.device = None, 
+    transform_class: str,
+    size: int,
+    device: torch.device = None,
     dtype: torch.dtype = None
 ) -> torch.Tensor:
-    if transform_class == "hadamard":
-        return hadamard_transform(torch.eye(size, device=device, dtype=dtype), scale=1 / math.sqrt(size))
-    elif transform_class == "identity":
-        return torch.eye(size, device=device, dtype=dtype)
-    else:
-        raise NotImplementedError(f"get_transform_matrix is implemented only for Hadamard and Identity transforms")
+    # Keep backward compatibility for existing identity/hadamard export paths.
+    if transform_class in ["hadamard", "identity"]:
+        transform = build_transform(transform_class, group_size=size, size=size, device=device, dtype=dtype)
+        matrix, _ = get_transform_matrices(transform, size=size, device=device, dtype=dtype)
+        return matrix
+    raise NotImplementedError(f"get_transform_matrix is implemented only for Hadamard and Identity transforms")
+
+
