@@ -151,15 +151,45 @@ class FPQuantLinear(nn.Module):
             ),
         )
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Original code assumed [hadamard_group_size, hadamard_group_size] buffers.
+        # New: allow loading exported checkpoints that store per-group transform banks
+        # (e.g. [num_groups, group_size, group_size]) by resizing placeholder buffers.
+        for buffer_name in ("forward_hadamard_matrix", "backward_hadamard_matrix"):
+            key = prefix + buffer_name
+            if key in state_dict:
+                incoming = state_dict[key]
+                current = self._buffers.get(buffer_name, None)
+                if current is None or tuple(current.shape) != tuple(incoming.shape):
+                    self._buffers[buffer_name] = torch.empty_like(incoming)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
 
     @torch.no_grad()
     def pre_forward(self):
-        # ===== [新增] 1) 如果是导出的 pseudoquant checkpoint：dqweight 已经在 state_dict 里 =====
-        # 这种情况下不需要（也不允许）再从 master weight 触发 pseudoquant 过程，
-        # 否则会在 CPU 上触发 Triton 或覆盖已加载的 dqweight。
+        # ===== [新增] 1) 如果是导出的 pseudoquant checkpoint：dqweight 已经�?state_dict �?=====
+        # 这种情况下不需要（也不允许）再�?master weight 触发 pseudoquant 过程�?        # 否则会在 CPU 上触�?Triton 或覆盖已加载�?dqweight�?        
         if self.config.pseudoquantization and (not self.config.store_master_weights):
             if getattr(self, "dqweight", None) is not None:
-                # 确保不保留/不依赖 master weight 路径
+                # 确保不保�?不依�?master weight 路径
                 self.weight = None
                 self.qweight = None
                 self.scales = None
@@ -167,9 +197,9 @@ class FPQuantLinear(nn.Module):
                 return
 
         # ===== [新增] 2) 若需要从 weight 生成量化参数，但当前不在 CUDA/XPU，则延迟 =====
-        # 注意：pseudoquant 的 Triton kernel 只能在 CUDA/XPU 上跑。
+        # 注意：pseudoquant �?Triton kernel 只能�?CUDA/XPU 上跑�?        
         if getattr(self, "weight", None) is None:
-            # 这里一般只会出现在不完整/不匹配的 checkpoint；先标记延迟，forward 时再报更明确的错
+            # 这里一般只会出现在不完�?不匹配的 checkpoint；先标记延迟，forward 时再报更明确的错
             setattr(self, "_fpq_deferred_pre_forward", True)
             return
 
@@ -274,11 +304,11 @@ class FPQuantLinear(nn.Module):
 
 
     def forward(self, x) -> torch.Tensor:
-        # ===== [新增] 如果 pre_forward 被延迟了，这里在真正上 CUDA/XPU 后补做一次 =====
+        # Deferred pre_forward is finalized once activations are on CUDA/XPU.
         if getattr(self, "_fpq_deferred_pre_forward", False):
             if x.device.type in ["cuda", "xpu"]:
                 self.pre_forward()
-            # pre_forward 可能因为依旧不在 device 而继续延迟；这种情况下给出明确错误
+            # If still deferred, raise a clear device-placement error.
             if getattr(self, "_fpq_deferred_pre_forward", False):
                 dev = None
                 if getattr(self, "weight", None) is not None:
@@ -411,4 +441,6 @@ class FPQuantLinear(nn.Module):
                 f"Forward dtype: {self.config.forward_dtype}, backward dtype: {self.config.backward_dtype}, "
                 f"store_master_weights: {self.config.store_master_weights}, pseudoquantization: {self.config.pseudoquantization} isn't supported yet."
             )
+
+
 

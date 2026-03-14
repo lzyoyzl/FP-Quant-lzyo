@@ -9,6 +9,20 @@ from .triton.mxfp4 import mxfp4_forward_kernel_wrapper
 from .triton.nvfp4 import nvfp4_forward_kernel_wrapper
 
 
+def _apply_groupwise_transform(x: torch.Tensor, group_matrices: torch.Tensor) -> torch.Tensor:
+    num_groups, group_size, _ = group_matrices.shape
+    expected_last_dim = num_groups * group_size
+    if x.shape[-1] != expected_last_dim:
+        raise ValueError(
+            f"Groupwise transform expects last dim {expected_last_dim}, got {x.shape[-1]}."
+        )
+
+    x_view = x.reshape(-1, num_groups, group_size)
+    matrices = group_matrices.to(device=x.device, dtype=x.dtype)
+    x_rot = torch.einsum("bgi,gij->bgj", x_view, matrices)
+    return x_rot.reshape_as(x)
+
+
 def forward_pseudoquantize(
     x: torch.Tensor,
     hadamard_matrix: torch.Tensor,
@@ -16,6 +30,14 @@ def forward_pseudoquantize(
     dtype: FPQuantDtype,
     forward_method: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Original path expects one shared 2D matrix per layer.
+    # New path: accept per-group matrix bank [num_groups, group_size, group_size]
+    # and fold it into x before running existing kernels with identity blocks.
+    if hadamard_matrix.ndim == 3:
+        group_size = hadamard_matrix.shape[-1]
+        x = _apply_groupwise_transform(x, hadamard_matrix)
+        hadamard_matrix = torch.eye(group_size, dtype=x.dtype, device=x.device)
+
     if dtype == FPQuantDtype.MXFP4:
         if forward_method == "quest":
             gaussian_scale = 2.92247856 / 6.0
@@ -189,3 +211,4 @@ class PseudoQuant4x16NoMasterFn(Function):
         )
 
         return grad_input, None, None, None, grad_bias, None, None, None
+

@@ -110,8 +110,16 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
 
     # Add quantization metadata
+    # Original path kept for reference (requested):
+    # config.quantization_config = prepare_quantization_config(args.hadamard_group_size, args.format, ...)
+    # New path: when transform_search is enabled, export group size should track search group size
+    # to avoid shape mismatch when loading exported per-group matrices.
+    export_hadamard_group_size = args.hadamard_group_size
+    if getattr(args, "transform_search", False) and args.w_group_size is not None:
+        export_hadamard_group_size = args.w_group_size
+
     config.quantization_config = prepare_quantization_config(
-        args.hadamard_group_size, 
+        export_hadamard_group_size,
         args.format,
         pseudoquantization=(args.export_quantized_model == "pseudoquant")
     )
@@ -525,6 +533,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

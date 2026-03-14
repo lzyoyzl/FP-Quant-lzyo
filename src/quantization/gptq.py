@@ -17,7 +17,11 @@ from .accumulate_hessian import accumulate_hessian
 # Original import kept for reference (requested).
 # from ..transforms.transforms import build_transform, get_transform_matrix
 from ..transforms.transforms import get_transform_matrices
-from .transform_search import build_block_input_transforms, format_transform_summary
+from .transform_search import (
+    build_block_input_transforms,
+    format_transform_summary,
+    get_export_transform_matrices,
+)
 from ..utils.linalg_utils import inv_sym
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
 from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_layer, get_mlp_layer, get_number_of_rows_and_cols
@@ -457,13 +461,20 @@ def gptq_quantization(
                 else:
                     layer_transform = down_in_transform
 
-                matrix_key = (id(layer_transform), gptq_handle.layer.weight.shape[-1])
+                allow_groupwise_export = args.export_quantized_model == "pseudoquant"
+                matrix_key = (
+                    id(layer_transform),
+                    gptq_handle.layer.weight.shape[-1],
+                    allow_groupwise_export,
+                )
                 if matrix_key not in transform_matrix_cache:
-                    forward_matrix, backward_matrix = get_transform_matrices(
-                        layer_transform,
-                        size=gptq_handle.layer.weight.shape[-1],
+                    forward_matrix, backward_matrix = get_export_transform_matrices(
+                        transform=layer_transform,
+                        layer_in_features=gptq_handle.layer.weight.shape[-1],
+                        fallback_group_size=args.hadamard_group_size,
                         device=gptq_handle.layer.weight.device,
                         dtype=orig_dtype,
+                        allow_groupwise=allow_groupwise_export,
                     )
                     transform_matrix_cache[matrix_key] = (forward_matrix.cpu(), backward_matrix.cpu())
                 forward_transform_matrix, backward_transform_matrix = transform_matrix_cache[matrix_key]
@@ -512,4 +523,9 @@ def gptq_quantization(
     clear_device_cache(garbage_collection=True)
 
     return quantized_state_dict, non_quantized_state_dict
+
+
+
+
+
 

@@ -289,3 +289,64 @@ def format_transform_summary(transform: BaseTransform) -> str:
 
 
 
+
+@torch.no_grad()
+def get_export_transform_matrices(
+    transform: BaseTransform,
+    layer_in_features: int,
+    fallback_group_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    allow_groupwise: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Get compact transform matrices for checkpoint export.
+
+    - For MixedGroupTransform:
+      - pseudoquant path can export full per-group bank: [num_groups, g, g]
+      - realquant path falls back to one representative block: [g, g]
+    - For single transforms:
+      - export per-block matrix whenever possible to keep checkpoints compact
+    """
+    if isinstance(transform, MixedGroupTransform):
+        if allow_groupwise:
+            return (
+                transform.forward_matrices.to(device=device, dtype=dtype),
+                transform.backward_matrices.to(device=device, dtype=dtype),
+            )
+
+        # Backward-compatible fallback for backends that only accept one matrix.
+        # Original behavior exported a single matrix; keep that contract for realquant.
+        counts = transform.summary()
+        if len(counts) > 1:
+            print(
+                "[transform_search] Warning: realquant export does not support per-group mixed transforms; "
+                "falling back to the most frequent transform block."
+            )
+        if len(transform.selected_transforms) > 0:
+            best_name = max(counts.items(), key=lambda kv: kv[1])[0]
+            best_idx = transform.selected_transforms.index(best_name)
+        else:
+            best_idx = 0
+        return (
+            transform.forward_matrices[best_idx].to(device=device, dtype=dtype),
+            transform.backward_matrices[best_idx].to(device=device, dtype=dtype),
+        )
+
+    # Original full-size materialization is kept as a fallback.
+    # New default: export compact block matrix size when transform supports it.
+    export_size = getattr(transform, "group_size", None) or fallback_group_size or layer_in_features
+    try:
+        return get_transform_matrices(
+            transform,
+            size=export_size,
+            device=device,
+            dtype=dtype,
+        )
+    except Exception:
+        return get_transform_matrices(
+            transform,
+            size=layer_in_features,
+            device=device,
+            dtype=dtype,
+        )

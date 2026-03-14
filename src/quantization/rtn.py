@@ -14,7 +14,11 @@ from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_
 # Original import kept for reference (requested).
 # from ..transforms.transforms import build_transform, get_transform_matrix
 from ..transforms.transforms import get_transform_matrices
-from .transform_search import build_block_input_transforms, format_transform_summary
+from .transform_search import (
+    build_block_input_transforms,
+    format_transform_summary,
+    get_export_transform_matrices,
+)
 
 
 def rtn_quantization(
@@ -206,13 +210,20 @@ def rtn_quantization(
                     # Original implementation kept for reference (requested).
                     # transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
                     # New path: export matrices from the exact transform instance used by this layer.
-                    matrix_key = (id(layer_transform), weight.shape[-1])
+                    allow_groupwise_export = args.export_quantized_model == "pseudoquant"
+                    matrix_key = (
+                        id(layer_transform),
+                        weight.shape[-1],
+                        allow_groupwise_export,
+                    )
                     if matrix_key not in transform_matrix_cache:
-                        forward_matrix, backward_matrix = get_transform_matrices(
-                            layer_transform,
-                            size=weight.shape[-1],
+                        forward_matrix, backward_matrix = get_export_transform_matrices(
+                            transform=layer_transform,
+                            layer_in_features=weight.shape[-1],
+                            fallback_group_size=args.hadamard_group_size,
                             device=weight.device,
                             dtype=orig_dtype,
+                            allow_groupwise=allow_groupwise_export,
                         )
                         transform_matrix_cache[matrix_key] = (forward_matrix.cpu(), backward_matrix.cpu())
                     forward_transform_matrix, backward_transform_matrix = transform_matrix_cache[matrix_key]
@@ -270,4 +281,8 @@ def rtn_quantization(
     clear_device_cache(garbage_collection=True)
 
     return quantized_state_dict, non_quantized_state_dict
+
+
+
+
 
