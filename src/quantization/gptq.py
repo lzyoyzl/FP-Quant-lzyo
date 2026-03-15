@@ -37,6 +37,84 @@ def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
     return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
 
 
+def _init_group_covariance_stats(in_features: int, group_size: int, device: torch.device):
+    if in_features % group_size != 0:
+        raise ValueError(f"in_features={in_features} must be divisible by group_size={group_size}.")
+    num_groups = in_features // group_size
+    return {
+        "group_size": group_size,
+        "num_groups": num_groups,
+        "xtx": torch.zeros((num_groups, group_size, group_size), device=device, dtype=torch.float32),
+        "count": 0,
+    }
+
+
+@torch.no_grad()
+def _update_group_covariance_stats(stats: dict, layer_input: torch.Tensor):
+    x = layer_input.detach().to(torch.float32).reshape(-1, layer_input.shape[-1])
+    x_groups = x.reshape(-1, stats["num_groups"], stats["group_size"])
+    stats["xtx"].add_(torch.einsum("bgi,bgj->gij", x_groups, x_groups))
+    stats["count"] += x_groups.shape[0]
+
+
+@torch.no_grad()
+def _finalize_group_covariance_stats(stats: dict) -> torch.Tensor:
+    if stats["count"] <= 0:
+        # Defensive fallback: identity covariance keeps search numerically stable.
+        return torch.eye(stats["group_size"], device=stats["xtx"].device, dtype=torch.float32).unsqueeze(0).repeat(stats["num_groups"], 1, 1)
+
+    covariance = stats["xtx"] / float(stats["count"])
+    if not torch.isfinite(covariance).all():
+        return torch.eye(stats["group_size"], device=stats["xtx"].device, dtype=torch.float32).unsqueeze(0).repeat(stats["num_groups"], 1, 1)
+    return covariance
+
+
+@torch.no_grad()
+def collect_block_slot_input_covariances(
+    block: nn.Module,
+    input_args: list,
+    input_kwargs: list,
+    group_size: int,
+    device: torch.device,
+    amp_enabled: bool,
+) -> dict[str, torch.Tensor]:
+    """
+    Collect per-slot group covariances E[x_g^T x_g] from calibration inputs,
+    then transform-search uses Cov' = T^T Cov T for GPTQ-consistent scoring.
+    """
+    slot_stats = {
+        "qkv": _init_group_covariance_stats(block.self_attn.q_proj.weight.shape[-1], group_size, device),
+        "o": _init_group_covariance_stats(block.self_attn.o_proj.weight.shape[-1], group_size, device),
+        "gate_up": _init_group_covariance_stats(block.mlp.gate_proj.weight.shape[-1], group_size, device),
+        "down": _init_group_covariance_stats(block.mlp.down_proj.weight.shape[-1], group_size, device),
+    }
+
+    def make_cov_hook(slot_name: str):
+        def _hook(_, inp, out):
+            if len(inp) == 0:
+                return
+            _update_group_covariance_stats(slot_stats[slot_name], inp[0])
+        return _hook
+
+    hooks = [
+        block.self_attn.q_proj.register_forward_hook(make_cov_hook("qkv")),
+        block.self_attn.o_proj.register_forward_hook(make_cov_hook("o")),
+        block.mlp.gate_proj.register_forward_hook(make_cov_hook("gate_up")),
+        block.mlp.down_proj.register_forward_hook(make_cov_hook("down")),
+    ]
+
+    device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+    try:
+        for cur_args, cur_kwargs in zip(input_args, input_kwargs):
+            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=amp_enabled):
+                block(*to(cur_args, device=device), **to(cur_kwargs, device=device))
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    return {slot_name: _finalize_group_covariance_stats(stats) for slot_name, stats in slot_stats.items()}
+
+
 class GPTQ:
 
     def __init__(
@@ -302,6 +380,28 @@ def gptq_quantization(
         # gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         # down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)
         # New path: optionally run per-group transform search to minimize quantization MSE.
+        # qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform = build_block_input_transforms(
+        #     block=block,
+        #     hidden_size=model.config.hidden_size,
+        #     intermediate_size=model.config.intermediate_size,
+        #     args=args,
+        #     device=device,
+        #     transform_kwargs=transform_kwargs,
+        #     weight_quantizer_kwargs=weight_quantizer_kwargs,
+        # )
+        # New objective path: for GPTQ+transform_search, collect per-slot activation covariance
+        # and search with a GPTQ-consistent weighted error objective.
+        slot_input_covariances = None
+        if args.transform_search:
+            slot_input_covariances = collect_block_slot_input_covariances(
+                block=block,
+                input_args=input_args,
+                input_kwargs=input_kwargs,
+                group_size=args.w_group_size,
+                device=device,
+                amp_enabled=args.amp,
+            )
+
         qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform = build_block_input_transforms(
             block=block,
             hidden_size=model.config.hidden_size,
@@ -310,10 +410,12 @@ def gptq_quantization(
             device=device,
             transform_kwargs=transform_kwargs,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
+            slot_input_covariances=slot_input_covariances,
         )
         if args.transform_search:
             print(
-                f"  [transform_search] qkv={format_transform_summary(qkv_in_transform)} | "
+                f"  [transform_search] objective=gptq_consistent | "
+                f"qkv={format_transform_summary(qkv_in_transform)} | "
                 f"o={format_transform_summary(o_in_transform)} | "
                 f"gate_up={format_transform_summary(gate_up_in_transform)} | "
                 f"down={format_transform_summary(down_in_transform)}"

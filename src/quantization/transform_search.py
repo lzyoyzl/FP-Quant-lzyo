@@ -109,6 +109,30 @@ def _compute_quantization_mse(x: torch.Tensor, quantizer_kwargs: dict[str, Any])
     return (x_q - x).pow(2).mean().item()
 
 
+def _compute_gptq_consistent_group_error(
+    rotated_group_weight: torch.Tensor,
+    quantizer_kwargs: dict[str, Any],
+    rotated_group_covariance: torch.Tensor,
+) -> float:
+    """
+    GPTQ-consistent local objective:
+        Tr(DeltaW * Cov' * DeltaW^T) / out_features
+    where:
+        DeltaW = Q(W') - W'
+        Cov'   = E[(xT)^T (xT)] for the current group.
+    """
+    # Fresh quantizer per score keeps global-scale/stat tracking isolated across candidates.
+    quantizer = Quantizer(**quantizer_kwargs)
+    scales, zeros = quantizer.get_quantization_params(rotated_group_weight)
+    rotated_group_weight_q = quantizer(rotated_group_weight, scales, zeros)
+    delta_w = rotated_group_weight_q - rotated_group_weight
+
+    # Weighted output-error proxy (matches GPTQ's Hessian-weighted spirit).
+    weighted_error = torch.einsum("oi,ij,oj->", delta_w, rotated_group_covariance, delta_w)
+    # Normalize by out_features so layers with larger row count do not dominate shared-slot search.
+    return (weighted_error / max(delta_w.shape[0], 1)).item()
+
+
 @torch.no_grad()
 def search_best_group_transform(
     weights: Sequence[torch.Tensor],
@@ -116,6 +140,7 @@ def search_best_group_transform(
     quantizer_kwargs: dict[str, Any],
     candidates: Sequence[str],
     device: torch.device,
+    group_covariances: Sequence[torch.Tensor] | None = None,
 ) -> MixedGroupTransform:
     if not weights:
         raise ValueError("weights must contain at least one tensor.")
@@ -127,6 +152,9 @@ def search_best_group_transform(
 
     if in_features % group_size != 0:
         raise ValueError(f"in_features={in_features} is not divisible by group_size={group_size}.")
+
+    if group_covariances is not None and len(group_covariances) != len(weights):
+        raise ValueError("group_covariances must be None or have the same length as weights.")
 
     candidates = _validate_candidates(candidates)
     if len(candidates) == 0:
@@ -189,12 +217,28 @@ def search_best_group_transform(
         for name in active_candidates:
             total_error = 0.0
             inv_t_matrix = candidate_backward[name]
+            forward_matrix = candidate_forward[name]
 
-            # Aggregate MSE over all layers that share this transform slot.
-            for weight in weights:
+            # Aggregate score over all layers that share this transform slot.
+            for weight_idx, weight in enumerate(weights):
                 group_weight = weight[:, start:end].to(torch.float32)
                 rotated_group = group_weight.matmul(inv_t_matrix)
-                total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+
+                # Original MSE-only objective kept for reference (requested).
+                # total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+
+                if group_covariances is None:
+                    # RTN / fallback path: keep historical behavior when activation covariance is unavailable.
+                    total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+                else:
+                    base_covariance = group_covariances[weight_idx][group_idx].to(device=device, dtype=torch.float32)
+                    # Because activation is transformed as x' = xT, covariance becomes Cov' = T^T Cov T.
+                    rotated_covariance = forward_matrix.transpose(-1, -2).matmul(base_covariance).matmul(forward_matrix)
+                    total_error += _compute_gptq_consistent_group_error(
+                        rotated_group_weight=rotated_group,
+                        quantizer_kwargs=quantizer_kwargs,
+                        rotated_group_covariance=rotated_covariance,
+                    )
 
             if total_error < best_error:
                 best_error = total_error
@@ -221,6 +265,7 @@ def build_block_input_transforms(
     device: torch.device,
     transform_kwargs: dict[str, Any],
     weight_quantizer_kwargs: dict[str, Any] | None,
+    slot_input_covariances: dict[str, torch.Tensor] | None = None,
 ):
     # Original non-search path preserved.
     if not getattr(args, "transform_search", False):
@@ -245,6 +290,10 @@ def build_block_input_transforms(
         quantizer_kwargs=weight_quantizer_kwargs,
         candidates=candidates,
         device=device,
+        group_covariances=(
+            [slot_input_covariances["qkv"], slot_input_covariances["qkv"], slot_input_covariances["qkv"]]
+            if slot_input_covariances is not None else None
+        ),
     )
 
     # Search o projection input transform.
@@ -254,6 +303,7 @@ def build_block_input_transforms(
         quantizer_kwargs=weight_quantizer_kwargs,
         candidates=candidates,
         device=device,
+        group_covariances=([slot_input_covariances["o"]] if slot_input_covariances is not None else None),
     )
 
     # Search gate/up shared transform against gate/up projection weights.
@@ -263,6 +313,10 @@ def build_block_input_transforms(
         quantizer_kwargs=weight_quantizer_kwargs,
         candidates=candidates,
         device=device,
+        group_covariances=(
+            [slot_input_covariances["gate_up"], slot_input_covariances["gate_up"]]
+            if slot_input_covariances is not None else None
+        ),
     )
 
     # Search down projection input transform.
@@ -272,6 +326,7 @@ def build_block_input_transforms(
         quantizer_kwargs=weight_quantizer_kwargs,
         candidates=candidates,
         device=device,
+        group_covariances=([slot_input_covariances["down"]] if slot_input_covariances is not None else None),
     )
 
     return qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform
