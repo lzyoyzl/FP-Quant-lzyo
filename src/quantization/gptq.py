@@ -21,6 +21,9 @@ from .transform_search import (
     build_block_input_transforms,
     format_transform_summary,
     get_export_transform_matrices,
+    should_collect_group_covariances,
+    resolve_transform_search_objective,
+    format_transform_search_objective,
 )
 from ..utils.linalg_utils import inv_sym
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
@@ -389,18 +392,24 @@ def gptq_quantization(
         #     transform_kwargs=transform_kwargs,
         #     weight_quantizer_kwargs=weight_quantizer_kwargs,
         # )
-        # New objective path: for GPTQ+transform_search, collect per-slot activation covariance
-        # and search with a GPTQ-consistent weighted error objective.
+        # New objective path: search objective is configurable (mse / cov / J_tail).
         slot_input_covariances = None
+        collect_covariances = False
         if args.transform_search:
-            slot_input_covariances = collect_block_slot_input_covariances(
-                block=block,
-                input_args=input_args,
-                input_kwargs=input_kwargs,
-                group_size=args.w_group_size,
-                device=device,
-                amp_enabled=args.amp,
+            collect_covariances = should_collect_group_covariances(
+                objective=getattr(args, "transform_search_objective", "auto"),
+                base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                auto_default="cov",
             )
+            if collect_covariances:
+                slot_input_covariances = collect_block_slot_input_covariances(
+                    block=block,
+                    input_args=input_args,
+                    input_kwargs=input_kwargs,
+                    group_size=args.w_group_size,
+                    device=device,
+                    amp_enabled=args.amp,
+                )
 
         qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform = build_block_input_transforms(
             block=block,
@@ -411,15 +420,40 @@ def gptq_quantization(
             transform_kwargs=transform_kwargs,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
             slot_input_covariances=slot_input_covariances,
+            auto_default_objective="cov",
         )
         if args.transform_search:
+            resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+                objective=getattr(args, "transform_search_objective", "auto"),
+                base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                has_group_covariances=slot_input_covariances is not None,
+                auto_default="cov",
+            )
+            objective_tag = format_transform_search_objective(
+                objective=resolved_objective,
+                base_loss=resolved_base_loss,
+                tail_lambda=float(getattr(args, "transform_search_tail_lambda", 0.0)),
+                tail_bins=int(getattr(args, "transform_search_tail_bins", 4)),
+                tail_weight_mode=str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform")),
+                tail_weight_power=float(getattr(args, "transform_search_tail_weight_power", 2.0)),
+            )
+            if slot_input_covariances is None:
+                cov_tag = "disabled"
+            else:
+                cov_tag = (
+                    f"enabled(qkv={slot_input_covariances['qkv'].shape[0]},"
+                    f"o={slot_input_covariances['o'].shape[0]},"
+                    f"gate_up={slot_input_covariances['gate_up'].shape[0]},"
+                    f"down={slot_input_covariances['down'].shape[0]})"
+                )
             print(
-                f"  [transform_search] objective=gptq_consistent | "
+                f"  [transform_search] objective={objective_tag} | "
+                f"group_covariances={cov_tag} | "
                 f"qkv={format_transform_summary(qkv_in_transform)} | "
                 f"o={format_transform_summary(o_in_transform)} | "
                 f"gate_up={format_transform_summary(gate_up_in_transform)} | "
                 f"down={format_transform_summary(down_in_transform)}"
-            )     
+            )
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(
@@ -541,7 +575,8 @@ def gptq_quantization(
             orig_weight = gptq_handle.layer.weight
             with torch.no_grad():
                 relative_mse_error = get_relative_mse_error(dequantized_qweight.float(), orig_weight.float(), gptq_handle.H)
-            print(f"[{layer_name:16}]: Relative MSE error: {relative_mse_error.item():.2e}")
+            # Original label kept for reference: "Relative MSE error".
+            print(f"[{layer_name:16}]: Relative Hessian error: {relative_mse_error.item():.2e}")
             if args.log_wandb:
                 wandb.log({f"gptq/{layer_name}_relative_mse": relative_mse_error.item()})
             gptq_handle.layer.weight.data = dequantized_qweight
