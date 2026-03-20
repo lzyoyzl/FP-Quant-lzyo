@@ -1,6 +1,6 @@
 # Group-wise Rotate Selection (MXFP4 / NVFP4)
 
-## 1. 功能概览
+## 1. 功能概览(test)
 
 当前实现支持在量化时按 `w_group_size` 对每个 group 列块搜索旋转，并在每个 Transformer block 的四个输入槽位分别搜索：
 
