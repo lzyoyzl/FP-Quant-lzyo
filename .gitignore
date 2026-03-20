@@ -188,3 +188,4 @@ env_var.sh
 /oyzl_test/results_quant/
 /oyzl_test/torch_home/
 /oyzl_test/xdg_cache/
+/oyzl_test/outputs/

@@ -5,7 +5,7 @@ set -euo pipefail
 # 0) 自动后台脱离（断网继续跑）
 ###############################################################################
 AUTO_DETACH="${AUTO_DETACH:-1}"
-LOG_DIR="${LOG_DIR:-lm_eval_logs_mx_mse_rotsearch_smoke}"
+LOG_DIR="${LOG_DIR:-lm_eval_logs_COV_mx_rotsearch_smoke}"
 mkdir -p "${LOG_DIR}"
 
 if [[ "${AUTO_DETACH}" == "1" && -t 1 && -z "${__DETACHED:-}" ]]; then
@@ -25,9 +25,9 @@ fi
 ###############################################################################
 # 1) 路径与公共配置（按需改）
 ###############################################################################
-MODEL_DIR="${MODEL_DIR:-/cephfs/shared/zlouyang/FP-Quant/oyzl_test/outputs/mxfp_gptq_mse_rotsearch_smoke}"
+MODEL_DIR="${MODEL_DIR:-/cephfs/shared/zlouyang/FP-Quant/oyzl_test/outputs-COV/mxfp_gptq_rotsearch_smoke}"
 
-OUT_DIR="${OUT_DIR:-lm_eval_results_mx_mse_rotsearch_smoke}"
+OUT_DIR="${OUT_DIR:-lm_eval_results_COV_mx_rotsearch_smoke}"
 mkdir -p "${OUT_DIR}"
 
 DEVICE="${DEVICE:-cuda}"
