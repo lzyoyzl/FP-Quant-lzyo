@@ -11,6 +11,9 @@ from ..transforms.transforms import BaseTransform, build_transform, get_transfor
 # We keep the default search space focused on practical transforms for FP4 group quantization.
 DEFAULT_SEARCH_TRANSFORMS = ["identity", "hadamard", "dct", "dst", "gsr", "householder"]
 SUPPORTED_SEARCH_TRANSFORMS = {"identity", "hadamard", "dct", "dst", "gsr", "householder", "fast_food"}
+SUPPORTED_SEARCH_OBJECTIVES = {"auto", "mse", "cov", "jtail"}
+SUPPORTED_SEARCH_BASE_LOSSES = {"mse", "cov"}
+SUPPORTED_TAIL_WEIGHT_MODES = {"a_low", "b_high", "mixed_uniform", "mixed_middle", "two_tail", "auto_abm"}
 
 
 class MixedGroupTransform(BaseTransform):
@@ -24,6 +27,7 @@ class MixedGroupTransform(BaseTransform):
         backward_matrices: torch.Tensor,
         group_size: int,
         selected_transforms: Sequence[str],
+        selected_tail_weight_modes: Sequence[str] | None = None,
     ):
         super().__init__()
         if forward_matrices.shape != backward_matrices.shape:
@@ -34,6 +38,15 @@ class MixedGroupTransform(BaseTransform):
         self.group_size = group_size
         self.num_groups = forward_matrices.shape[0]
         self.selected_transforms = list(selected_transforms)
+
+        if selected_tail_weight_modes is None:
+            self.selected_tail_weight_modes = []
+        else:
+            if len(selected_tail_weight_modes) != self.num_groups:
+                raise ValueError(
+                    "selected_tail_weight_modes must be None or have length equal to num_groups."
+                )
+            self.selected_tail_weight_modes = list(selected_tail_weight_modes)
 
         # Keep canonical matrices in fp32 buffers, then cast on-the-fly to input dtype/device.
         self.register_buffer("forward_matrices", forward_matrices.to(torch.float32), persistent=False)
@@ -82,6 +95,11 @@ class MixedGroupTransform(BaseTransform):
     def summary(self) -> dict[str, int]:
         return dict(Counter(self.selected_transforms))
 
+    def tail_weight_mode_summary(self) -> dict[str, int]:
+        if not self.selected_tail_weight_modes:
+            return {}
+        return dict(Counter(self.selected_tail_weight_modes))
+
 
 def _validate_candidates(candidates: Sequence[str]) -> list[str]:
     ordered_unique = []
@@ -109,10 +127,18 @@ def _compute_quantization_mse(x: torch.Tensor, quantizer_kwargs: dict[str, Any])
     return (x_q - x).pow(2).mean().item()
 
 
+def _compute_quantization_delta(x: torch.Tensor, quantizer_kwargs: dict[str, Any]) -> torch.Tensor:
+    quantizer = Quantizer(**quantizer_kwargs)
+    scales, zeros = quantizer.get_quantization_params(x)
+    x_q = quantizer(x, scales, zeros)
+    return x_q - x
+
+
 def _compute_gptq_consistent_group_error(
     rotated_group_weight: torch.Tensor,
     quantizer_kwargs: dict[str, Any],
     rotated_group_covariance: torch.Tensor,
+    delta_w: torch.Tensor | None = None,
 ) -> float:
     """
     GPTQ-consistent local objective:
@@ -121,16 +147,198 @@ def _compute_gptq_consistent_group_error(
         DeltaW = Q(W') - W'
         Cov'   = E[(xT)^T (xT)] for the current group.
     """
-    # Fresh quantizer per score keeps global-scale/stat tracking isolated across candidates.
-    quantizer = Quantizer(**quantizer_kwargs)
-    scales, zeros = quantizer.get_quantization_params(rotated_group_weight)
-    rotated_group_weight_q = quantizer(rotated_group_weight, scales, zeros)
-    delta_w = rotated_group_weight_q - rotated_group_weight
+    if delta_w is None:
+        # Fresh quantizer per score keeps global-scale/stat tracking isolated across candidates.
+        delta_w = _compute_quantization_delta(rotated_group_weight, quantizer_kwargs)
 
     # Weighted output-error proxy (matches GPTQ's Hessian-weighted spirit).
     weighted_error = torch.einsum("oi,ij,oj->", delta_w, rotated_group_covariance, delta_w)
     # Normalize by out_features so layers with larger row count do not dominate shared-slot search.
     return (weighted_error / max(delta_w.shape[0], 1)).item()
+
+
+def _build_tail_bin_weights(
+    tail_bins: int,
+    tail_weight_mode: str,
+    tail_weight_power: float,
+    device: torch.device,
+) -> torch.Tensor:
+    if tail_weight_mode not in SUPPORTED_TAIL_WEIGHT_MODES:
+        raise ValueError(
+            f"Unsupported tail_weight_mode '{tail_weight_mode}'. "
+            f"Supported: {sorted(SUPPORTED_TAIL_WEIGHT_MODES)}"
+        )
+    if tail_weight_power <= 0:
+        raise ValueError(f"tail_weight_power must be > 0, got {tail_weight_power}.")
+    if tail_weight_mode == "auto_abm":
+        # auto_abm must be resolved to a concrete mode before building alpha.
+        raise ValueError("tail_weight_mode auto_abm must be resolved per-group before weight building.")
+
+    idx = torch.arange(tail_bins, device=device, dtype=torch.float32)
+    if tail_weight_mode == "a_low":
+        # A-type: emphasize low-quantile bins.
+        alpha = ((tail_bins - idx) / max(tail_bins, 1)).pow(tail_weight_power)
+    elif tail_weight_mode == "b_high":
+        # B-type: emphasize high-quantile bins.
+        alpha = ((idx + 1.0) / max(tail_bins, 1)).pow(tail_weight_power)
+    elif tail_weight_mode == "mixed_uniform":
+        # Mixed-type: uniform bin weights.
+        alpha = torch.ones(tail_bins, device=device, dtype=torch.float32)
+    elif tail_weight_mode == "mixed_middle":
+        # Mixed-type: emphasize middle quantile bins.
+        center = (tail_bins - 1.0) / 2.0
+        denom = max(center, 1.0)
+        dist = (idx - center).abs() / denom
+        alpha = (1.0 - dist).clamp_min(0.0).pow(tail_weight_power) + 1e-3
+    else:
+        # Legacy mode: emphasize both tails.
+        center = (tail_bins - 1.0) / 2.0
+        denom = max(center, 1.0)
+        dist = (idx - center).abs() / denom
+        alpha = dist.clamp_min(0.0).pow(tail_weight_power) + 1e-3
+
+    return alpha / alpha.clamp_min(1e-12).mean()
+
+
+def _select_tail_weight_mode_for_group(
+    group_weights: Sequence[torch.Tensor],
+) -> str:
+    """
+    Auto-select A/B/mixed mode from group-block distribution.
+
+    Heuristic (based on |W_g| quantiles):
+    - A-type (a_low): sharp outliers above already-high values.
+    - B-type (b_high): high values dominate most of the block.
+    - Mixed: fallback.
+    """
+    if len(group_weights) == 0:
+        return "mixed_uniform"
+
+    merged = torch.cat([w.reshape(-1).abs().to(torch.float32) for w in group_weights], dim=0)
+    if merged.numel() == 0:
+        return "mixed_uniform"
+
+    q50, q90, q99 = torch.quantile(merged, torch.tensor([0.50, 0.90, 0.99], device=merged.device)).tolist()
+    eps = 1e-8
+    outlier_sharpness = q99 / (q90 + eps)
+    bulk_to_peak = q50 / (q99 + eps)
+    high_to_peak = q90 / (q99 + eps)
+
+    # A-type: few sharp outliers + low bulk level.
+    if outlier_sharpness >= 1.6 and bulk_to_peak <= 0.30:
+        return "a_low"
+    # B-type: most values are already high.
+    if bulk_to_peak >= 0.45 and high_to_peak >= 0.80:
+        return "b_high"
+    # Mixed fallback.
+    return "mixed_uniform"
+
+
+def _compute_tail_quantile_error(
+    delta_w: torch.Tensor,
+    reference_weight: torch.Tensor,
+    tail_bins: int,
+    tail_weight_mode: str,
+    tail_weight_power: float,
+) -> float:
+    """
+    Quantile tail term:
+        L_tail = sum_b alpha_b * MSE_b
+    where bins are formed on |reference_weight| quantiles.
+    """
+    if tail_bins <= 1:
+        return delta_w.pow(2).mean().item()
+
+    sq_err = delta_w.pow(2).reshape(-1).to(torch.float32)
+    abs_ref = reference_weight.abs().reshape(-1).to(torch.float32)
+    if sq_err.numel() == 0:
+        return 0.0
+
+    quantiles = torch.linspace(0.0, 1.0, tail_bins + 1, device=abs_ref.device, dtype=abs_ref.dtype)
+    bin_edges = torch.quantile(abs_ref, quantiles)
+    if not torch.isfinite(bin_edges).all():
+        return sq_err.mean().item()
+
+    # Internal edges produce bucket ids in [0, tail_bins-1].
+    bucket_ids = torch.bucketize(abs_ref, bin_edges[1:-1], right=False)
+    alpha = _build_tail_bin_weights(
+        tail_bins=tail_bins,
+        tail_weight_mode=tail_weight_mode,
+        tail_weight_power=tail_weight_power,
+        device=abs_ref.device,
+    )
+
+    weighted = torch.tensor(0.0, device=abs_ref.device, dtype=torch.float32)
+    normalizer = torch.tensor(0.0, device=abs_ref.device, dtype=torch.float32)
+    for bin_idx in range(tail_bins):
+        bin_mask = bucket_ids == bin_idx
+        if bin_mask.any():
+            bin_mse = sq_err[bin_mask].mean()
+        else:
+            # Empty bin fallback keeps objective stable for degenerate distributions.
+            bin_mse = sq_err.mean()
+        weighted = weighted + alpha[bin_idx] * bin_mse
+        normalizer = normalizer + alpha[bin_idx]
+
+    return (weighted / normalizer.clamp_min(1e-12)).item()
+
+
+def should_collect_group_covariances(
+    objective: str,
+    base_loss: str,
+    auto_default: str,
+) -> bool:
+    resolved_objective = auto_default if objective == "auto" else objective
+    if resolved_objective == "cov":
+        return True
+    if resolved_objective == "jtail" and base_loss == "cov":
+        return True
+    return False
+
+
+def resolve_transform_search_objective(
+    objective: str,
+    base_loss: str,
+    has_group_covariances: bool,
+    auto_default: str,
+) -> tuple[str, str]:
+    if objective not in SUPPORTED_SEARCH_OBJECTIVES:
+        raise ValueError(
+            f"Unsupported transform_search objective '{objective}'. "
+            f"Supported: {sorted(SUPPORTED_SEARCH_OBJECTIVES)}"
+        )
+    if base_loss not in SUPPORTED_SEARCH_BASE_LOSSES:
+        raise ValueError(
+            f"Unsupported transform_search base loss '{base_loss}'. "
+            f"Supported: {sorted(SUPPORTED_SEARCH_BASE_LOSSES)}"
+        )
+    if auto_default not in {"mse", "cov"}:
+        raise ValueError(f"auto_default must be 'mse' or 'cov', got '{auto_default}'.")
+
+    resolved_objective = auto_default if objective == "auto" else objective
+    resolved_base_loss = base_loss if resolved_objective == "jtail" else resolved_objective
+
+    if resolved_base_loss == "cov" and not has_group_covariances:
+        raise ValueError(
+            "transform_search objective requires group_covariances, but they are unavailable."
+        )
+    return resolved_objective, resolved_base_loss
+
+
+def format_transform_search_objective(
+    objective: str,
+    base_loss: str,
+    tail_lambda: float,
+    tail_bins: int,
+    tail_weight_mode: str = "mixed_uniform",
+    tail_weight_power: float = 2.0,
+) -> str:
+    if objective == "jtail":
+        return (
+            f"J_tail(base={base_loss},lambda={tail_lambda:.3g},bins={tail_bins},"
+            f"weights={tail_weight_mode},power={tail_weight_power:.3g})"
+        )
+    return objective
 
 
 @torch.no_grad()
@@ -141,6 +349,13 @@ def search_best_group_transform(
     candidates: Sequence[str],
     device: torch.device,
     group_covariances: Sequence[torch.Tensor] | None = None,
+    objective: str = "mse",
+    base_loss: str = "mse",
+    tail_lambda: float = 0.0,
+    tail_bins: int = 4,
+    tail_weight_mode: str = "mixed_uniform",
+    tail_weight_power: float = 2.0,
+    auto_default_objective: str = "mse",
 ) -> MixedGroupTransform:
     if not weights:
         raise ValueError("weights must contain at least one tensor.")
@@ -153,8 +368,27 @@ def search_best_group_transform(
     if in_features % group_size != 0:
         raise ValueError(f"in_features={in_features} is not divisible by group_size={group_size}.")
 
-    if group_covariances is not None and len(group_covariances) != len(weights):
+    has_group_covariances = group_covariances is not None
+    if has_group_covariances and len(group_covariances) != len(weights):
         raise ValueError("group_covariances must be None or have the same length as weights.")
+    if tail_lambda < 0:
+        raise ValueError(f"tail_lambda must be >= 0, got {tail_lambda}.")
+    if tail_bins < 2:
+        raise ValueError(f"tail_bins must be >= 2, got {tail_bins}.")
+    if tail_weight_power <= 0:
+        raise ValueError(f"tail_weight_power must be > 0, got {tail_weight_power}.")
+    if tail_weight_mode not in SUPPORTED_TAIL_WEIGHT_MODES:
+        raise ValueError(
+            f"Unsupported tail_weight_mode '{tail_weight_mode}'. "
+            f"Supported: {sorted(SUPPORTED_TAIL_WEIGHT_MODES)}"
+        )
+
+    resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+        objective=objective,
+        base_loss=base_loss,
+        has_group_covariances=has_group_covariances,
+        auto_default=auto_default_objective,
+    )
 
     candidates = _validate_candidates(candidates)
     if len(candidates) == 0:
@@ -206,6 +440,7 @@ def search_best_group_transform(
     selected_names: list[str] = []
     selected_forward: list[torch.Tensor] = []
     selected_backward: list[torch.Tensor] = []
+    selected_tail_weight_modes: list[str] | None = [] if resolved_objective == "jtail" else None
 
     for group_idx in range(num_groups):
         start = group_idx * group_size
@@ -213,6 +448,12 @@ def search_best_group_transform(
 
         best_name = active_candidates[0]
         best_error = float("inf")
+
+        # New: when mode=auto_abm, classify this group block into A/B/mixed before candidate scoring.
+        group_tail_weight_mode = tail_weight_mode
+        if resolved_objective == "jtail" and tail_weight_mode == "auto_abm":
+            group_weights_for_mode = [w[:, start:end].to(torch.float32) for w in weights]
+            group_tail_weight_mode = _select_tail_weight_mode_for_group(group_weights_for_mode)
 
         for name in active_candidates:
             total_error = 0.0
@@ -224,21 +465,43 @@ def search_best_group_transform(
                 group_weight = weight[:, start:end].to(torch.float32)
                 rotated_group = group_weight.matmul(inv_t_matrix)
 
-                # Original MSE-only objective kept for reference (requested).
-                # total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+                delta_w = _compute_quantization_delta(rotated_group, quantizer_kwargs)
 
-                if group_covariances is None:
-                    # RTN / fallback path: keep historical behavior when activation covariance is unavailable.
-                    total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+                # Original objective branch kept for reference (requested):
+                # if group_covariances is None:
+                #     total_error += _compute_quantization_mse(rotated_group, quantizer_kwargs)
+                # else:
+                #     base_covariance = group_covariances[weight_idx][group_idx].to(device=device, dtype=torch.float32)
+                #     rotated_covariance = forward_matrix.transpose(-1, -2).matmul(base_covariance).matmul(forward_matrix)
+                #     total_error += _compute_gptq_consistent_group_error(
+                #         rotated_group_weight=rotated_group,
+                #         quantizer_kwargs=quantizer_kwargs,
+                #         rotated_group_covariance=rotated_covariance,
+                #     )
+                if resolved_base_loss == "mse":
+                    base_error = delta_w.pow(2).mean().item()
                 else:
                     base_covariance = group_covariances[weight_idx][group_idx].to(device=device, dtype=torch.float32)
                     # Because activation is transformed as x' = xT, covariance becomes Cov' = T^T Cov T.
                     rotated_covariance = forward_matrix.transpose(-1, -2).matmul(base_covariance).matmul(forward_matrix)
-                    total_error += _compute_gptq_consistent_group_error(
+                    base_error = _compute_gptq_consistent_group_error(
                         rotated_group_weight=rotated_group,
                         quantizer_kwargs=quantizer_kwargs,
                         rotated_group_covariance=rotated_covariance,
+                        delta_w=delta_w,
                     )
+
+                if resolved_objective == "jtail":
+                    tail_error = _compute_tail_quantile_error(
+                        delta_w=delta_w,
+                        reference_weight=rotated_group,
+                        tail_bins=tail_bins,
+                        tail_weight_mode=group_tail_weight_mode,
+                        tail_weight_power=tail_weight_power,
+                    )
+                    total_error += base_error + tail_lambda * tail_error
+                else:
+                    total_error += base_error
 
             if total_error < best_error:
                 best_error = total_error
@@ -247,12 +510,15 @@ def search_best_group_transform(
         selected_names.append(best_name)
         selected_forward.append(candidate_forward[best_name])
         selected_backward.append(candidate_backward[best_name])
+        if selected_tail_weight_modes is not None:
+            selected_tail_weight_modes.append(group_tail_weight_mode)
 
     return MixedGroupTransform(
         forward_matrices=torch.stack(selected_forward, dim=0),
         backward_matrices=torch.stack(selected_backward, dim=0),
         group_size=group_size,
         selected_transforms=selected_names,
+        selected_tail_weight_modes=selected_tail_weight_modes,
     )
 
 
@@ -266,6 +532,7 @@ def build_block_input_transforms(
     transform_kwargs: dict[str, Any],
     weight_quantizer_kwargs: dict[str, Any] | None,
     slot_input_covariances: dict[str, torch.Tensor] | None = None,
+    auto_default_objective: str = "mse",
 ):
     # Original non-search path preserved.
     if not getattr(args, "transform_search", False):
@@ -282,6 +549,16 @@ def build_block_input_transforms(
 
     candidates = getattr(args, "transform_search_candidates", DEFAULT_SEARCH_TRANSFORMS)
     group_size = args.w_group_size
+    resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+        objective=getattr(args, "transform_search_objective", "auto"),
+        base_loss=getattr(args, "transform_search_base_loss", "cov"),
+        has_group_covariances=slot_input_covariances is not None,
+        auto_default=auto_default_objective,
+    )
+    tail_lambda = float(getattr(args, "transform_search_tail_lambda", 0.0))
+    tail_bins = int(getattr(args, "transform_search_tail_bins", 4))
+    tail_weight_mode = str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform"))
+    tail_weight_power = float(getattr(args, "transform_search_tail_weight_power", 2.0))
 
     # Search qkv shared transform against q/k/v projection weights.
     qkv_in_transform = search_best_group_transform(
@@ -294,6 +571,13 @@ def build_block_input_transforms(
             [slot_input_covariances["qkv"], slot_input_covariances["qkv"], slot_input_covariances["qkv"]]
             if slot_input_covariances is not None else None
         ),
+        objective=resolved_objective,
+        base_loss=resolved_base_loss,
+        tail_lambda=tail_lambda,
+        tail_bins=tail_bins,
+        tail_weight_mode=tail_weight_mode,
+        tail_weight_power=tail_weight_power,
+        auto_default_objective=auto_default_objective,
     )
 
     # Search o projection input transform.
@@ -304,6 +588,13 @@ def build_block_input_transforms(
         candidates=candidates,
         device=device,
         group_covariances=([slot_input_covariances["o"]] if slot_input_covariances is not None else None),
+        objective=resolved_objective,
+        base_loss=resolved_base_loss,
+        tail_lambda=tail_lambda,
+        tail_bins=tail_bins,
+        tail_weight_mode=tail_weight_mode,
+        tail_weight_power=tail_weight_power,
+        auto_default_objective=auto_default_objective,
     )
 
     # Search gate/up shared transform against gate/up projection weights.
@@ -317,6 +608,13 @@ def build_block_input_transforms(
             [slot_input_covariances["gate_up"], slot_input_covariances["gate_up"]]
             if slot_input_covariances is not None else None
         ),
+        objective=resolved_objective,
+        base_loss=resolved_base_loss,
+        tail_lambda=tail_lambda,
+        tail_bins=tail_bins,
+        tail_weight_mode=tail_weight_mode,
+        tail_weight_power=tail_weight_power,
+        auto_default_objective=auto_default_objective,
     )
 
     # Search down projection input transform.
@@ -327,6 +625,13 @@ def build_block_input_transforms(
         candidates=candidates,
         device=device,
         group_covariances=([slot_input_covariances["down"]] if slot_input_covariances is not None else None),
+        objective=resolved_objective,
+        base_loss=resolved_base_loss,
+        tail_lambda=tail_lambda,
+        tail_bins=tail_bins,
+        tail_weight_mode=tail_weight_mode,
+        tail_weight_power=tail_weight_power,
+        auto_default_objective=auto_default_objective,
     )
 
     return qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform
@@ -336,7 +641,14 @@ def format_transform_summary(transform: BaseTransform) -> str:
     if isinstance(transform, MixedGroupTransform):
         counts = transform.summary()
         ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        return ", ".join([f"{name}:{count}" for name, count in ordered])
+        summary = ", ".join([f"{name}:{count}" for name, count in ordered])
+
+        tail_counts = transform.tail_weight_mode_summary()
+        if len(tail_counts) > 0:
+            tail_ordered = sorted(tail_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            tail_summary = ", ".join([f"{name}:{count}" for name, count in tail_ordered])
+            summary = f"{summary} | tail_mode={tail_summary}"
+        return summary
     return "single_transform"
 
 
@@ -405,3 +717,4 @@ def get_export_transform_matrices(
             device=device,
             dtype=dtype,
         )
+

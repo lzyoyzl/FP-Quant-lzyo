@@ -16,7 +16,13 @@ from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
-from src.quantization.transform_search import DEFAULT_SEARCH_TRANSFORMS, SUPPORTED_SEARCH_TRANSFORMS
+from src.quantization.transform_search import (
+    DEFAULT_SEARCH_TRANSFORMS,
+    SUPPORTED_SEARCH_TRANSFORMS,
+    SUPPORTED_SEARCH_OBJECTIVES,
+    SUPPORTED_SEARCH_BASE_LOSSES,
+    SUPPORTED_TAIL_WEIGHT_MODES,
+)
 from src.utils.common_utils import fix_seed
 from src.utils.data_utils import get_data, get_wikitext2
 
@@ -260,11 +266,11 @@ def parse_args():
         default=128,
         help="Hadamard group size"
     )
-    # New: enable per-group transform search that minimizes quantization MSE.
+    # New: enable per-group transform search with configurable objective.
     parser.add_argument(
         "--transform_search",
         action="store_true",
-        help="Enable per-group transform search to minimize quantization MSE.",
+        help="Enable per-group transform search for rotation selection.",
     )
     # New: candidate transforms explored during group-wise search.
     parser.add_argument(
@@ -273,6 +279,45 @@ def parse_args():
         type=str,
         default=DEFAULT_SEARCH_TRANSFORMS,
         help="Candidate transform classes used by --transform_search.",
+    )
+    parser.add_argument(
+        "--transform_search_objective",
+        type=str,
+        default="auto",
+        choices=sorted(SUPPORTED_SEARCH_OBJECTIVES),
+        help="Transform-search objective: auto/mse/cov/jtail.",
+    )
+    parser.add_argument(
+        "--transform_search_base_loss",
+        type=str,
+        default="cov",
+        choices=sorted(SUPPORTED_SEARCH_BASE_LOSSES),
+        help="Base loss L(T) used when objective=jtail.",
+    )
+    parser.add_argument(
+        "--transform_search_tail_lambda",
+        type=float,
+        default=0.0,
+        help="Lambda coefficient for J_tail = L + lambda * L_tail.",
+    )
+    parser.add_argument(
+        "--transform_search_tail_bins",
+        type=int,
+        default=4,
+        help="Number of quantile bins used by L_tail.",
+    )
+    parser.add_argument(
+        "--transform_search_tail_weight_mode",
+        type=str,
+        default="mixed_uniform",
+        choices=sorted(SUPPORTED_TAIL_WEIGHT_MODES),
+        help="Tail-bin weight profile for L_tail: a_low/b_high/mixed_uniform/mixed_middle/two_tail/auto_abm.",
+    )
+    parser.add_argument(
+        "--transform_search_tail_weight_power",
+        type=float,
+        default=2.0,
+        help="Shape parameter for tail-bin weight profile (>0).",
     )
     # Logging params
     parser.add_argument(
@@ -369,6 +414,25 @@ def parse_args():
         assert args.w_bits < 16, "--transform_search requires weight quantization (w_bits < 16)."
         assert args.w_granularity == "group", "--transform_search requires --w_granularity group."
         assert args.w_group_size is not None, "--transform_search requires a valid --w_group_size."
+        assert args.transform_search_tail_lambda >= 0, "--transform_search_tail_lambda must be >= 0."
+        assert args.transform_search_tail_bins >= 2, "--transform_search_tail_bins must be >= 2."
+        assert args.transform_search_tail_weight_power > 0, "--transform_search_tail_weight_power must be > 0."
+
+        if args.transform_search_objective not in SUPPORTED_SEARCH_OBJECTIVES:
+            raise ValueError(
+                f"Invalid --transform_search_objective: {args.transform_search_objective}. "
+                f"Supported: {sorted(SUPPORTED_SEARCH_OBJECTIVES)}"
+            )
+        if args.transform_search_base_loss not in SUPPORTED_SEARCH_BASE_LOSSES:
+            raise ValueError(
+                f"Invalid --transform_search_base_loss: {args.transform_search_base_loss}. "
+                f"Supported: {sorted(SUPPORTED_SEARCH_BASE_LOSSES)}"
+            )
+        if args.transform_search_tail_weight_mode not in SUPPORTED_TAIL_WEIGHT_MODES:
+            raise ValueError(
+                f"Invalid --transform_search_tail_weight_mode: {args.transform_search_tail_weight_mode}. "
+                f"Supported: {sorted(SUPPORTED_TAIL_WEIGHT_MODES)}"
+            )
 
         # Deduplicate while preserving order so search behavior is deterministic.
         dedup_candidates = []
@@ -533,6 +597,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

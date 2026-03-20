@@ -18,7 +18,11 @@ from .transform_search import (
     build_block_input_transforms,
     format_transform_summary,
     get_export_transform_matrices,
+    should_collect_group_covariances,
+    resolve_transform_search_objective,
+    format_transform_search_objective,
 )
+from .gptq import collect_block_slot_input_covariances
 
 
 def rtn_quantization(
@@ -31,6 +35,12 @@ def rtn_quantization(
     orig_dtype = model.config.torch_dtype if args.dtype == "auto" else args.dtype
     act_offload_device = "cpu" if args.cpu_offload_activations else device
     need_calibration = args.scale_precision == ScalePrecision.E4M3
+    need_transform_covariances = bool(getattr(args, "transform_search", False)) and should_collect_group_covariances(
+        objective=getattr(args, "transform_search_objective", "auto"),
+        base_loss=getattr(args, "transform_search_base_loss", "cov"),
+        auto_default="mse",
+    )
+    need_block_inputs = need_calibration or need_transform_covariances
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
@@ -62,7 +72,7 @@ def rtn_quantization(
             scale_precision=args.scale_precision,
         )
 
-    if need_calibration:
+    if need_block_inputs:
         blocks = model.model.layers
         blocks[0] = InputCollector(blocks[0], cpu_offload=args.cpu_offload_activations)
         if args.cpu_offload_modules:
@@ -95,6 +105,17 @@ def rtn_quantization(
         # gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         # down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)
         # New path: optionally run per-group transform search to minimize quantization MSE.
+        slot_input_covariances = None
+        if need_transform_covariances:
+            slot_input_covariances = collect_block_slot_input_covariances(
+                block=block,
+                input_args=input_args,
+                input_kwargs=input_kwargs,
+                group_size=args.w_group_size,
+                device=device,
+                amp_enabled=args.amp,
+            )
+
         qkv_in_transform, o_in_transform, gate_up_in_transform, down_in_transform = build_block_input_transforms(
             block=block,
             hidden_size=model.config.hidden_size,
@@ -103,14 +124,41 @@ def rtn_quantization(
             device=device,
             transform_kwargs=transform_kwargs,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
+            slot_input_covariances=slot_input_covariances,
+            auto_default_objective="mse",
         )
         if args.transform_search:
+            resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+                objective=getattr(args, "transform_search_objective", "auto"),
+                base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                has_group_covariances=slot_input_covariances is not None,
+                auto_default="mse",
+            )
+            objective_tag = format_transform_search_objective(
+                objective=resolved_objective,
+                base_loss=resolved_base_loss,
+                tail_lambda=float(getattr(args, "transform_search_tail_lambda", 0.0)),
+                tail_bins=int(getattr(args, "transform_search_tail_bins", 4)),
+                tail_weight_mode=str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform")),
+                tail_weight_power=float(getattr(args, "transform_search_tail_weight_power", 2.0)),
+            )
+            if slot_input_covariances is None:
+                cov_tag = "disabled"
+            else:
+                cov_tag = (
+                    f"enabled(qkv={slot_input_covariances['qkv'].shape[0]},"
+                    f"o={slot_input_covariances['o'].shape[0]},"
+                    f"gate_up={slot_input_covariances['gate_up'].shape[0]},"
+                    f"down={slot_input_covariances['down'].shape[0]})"
+                )
             print(
-                f"  [transform_search] qkv={format_transform_summary(qkv_in_transform)} | "
+                f"  [transform_search] objective={objective_tag} | "
+                f"group_covariances={cov_tag} | "
+                f"qkv={format_transform_summary(qkv_in_transform)} | "
                 f"o={format_transform_summary(o_in_transform)} | "
                 f"gate_up={format_transform_summary(gate_up_in_transform)} | "
                 f"down={format_transform_summary(down_in_transform)}"
-            )     
+            )
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(

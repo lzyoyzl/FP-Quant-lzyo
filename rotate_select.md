@@ -1,139 +1,179 @@
 # Group-wise Rotate Selection (MXFP4 / NVFP4)
 
-## 1. 功能概述
+## 1. ���ܸ���
 
-当前实现支持在量化时按 `group` 自动选择最优旋转算法（GPTQ 路径默认目标：GPTQ 一致的激活加权误差；RTN 路径回退为量化 MSE）。
+��ǰʵ��֧��������ʱ�� `w_group_size` ��ÿ�� group �п�������ת������ÿ�� Transformer block ���ĸ������λ�ֱ�������
 
-- 开关参数：`--transform_search`
-- 候选旋转：`--transform_search_candidates`
-- 默认候选：`identity hadamard dct dst gsr householder`
-- 搜索粒度：按 `w_group_size` 分组，在每个 group 上独立选最优旋转
-- 作用位置：每个 block 的 `qkv / o / gate_up / down` 四类输入变换分别搜索
+- `qkv`��q/k/v ������
+- `o`
+- `gate_up`��gate/up ������
+- `down`
 
-## 1.1 当前搜索目标（GPTQ 一致）
+���ز�����`--transform_search`
 
-当启用 `--gptq --transform_search` 时，当前实现不再使用纯 weight-MSE 作为唯一目标，而是使用 GPTQ 一致的局部加权误差：
+## 2. ��ת����Ŀ�꣨��ѡ��
 
-- 对每个 group、每个候选变换 `T`：
-  - 权重旋转：`W' = W T^{-T}`
-  - 量化误差：`DeltaW = Q(W') - W'`
-  - 激活协方差旋转：`Cov' = T^T Cov T`
-  - 打分：`score = Tr(DeltaW * Cov' * DeltaW^T) / out_features`
+��ѡĿ�꣺
 
-说明：
+1. `mse`
+- `L(T) = MSE(Q(W') - W')`
 
-- `Cov` 来自该 block 校准数据上对应槽位输入（qkv/o/gate_up/down）的 group 协方差统计。
-- 该目标与 GPTQ 的 Hessian 加权思想一致，比纯 MSE 更贴近最终量化目标。
-- 若协方差不可用（如 RTN 路径），会自动回退到原有 MSE 目标。
+2. `cov`
+- `L(T) = Tr(DeltaW * Cov' * DeltaW^T) / out_features`
+- `W' = W T^{-T}`
+- `Cov' = T^T Cov T`
 
-## 2. 线性等价性保证
+3. `jtail`
+- `J_tail(T) = L(T) + lambda * L_tail(T)`
+- ���� `L(T)` �� `--transform_search_base_loss` ָ����`mse` �� `cov`��
+- `L_tail(T)` Ϊ��λ�� bin ��Ȩ�����
 
-实现中使用的是等价配对：
+## 3. A/B/��������Դ��Ȩ�ز���
 
-- 激活：`x' = xT`
-- 权重：`W' = W T^{-T}`
+��μ��е������ֱ��ӳ�䵽 `jtail` ��β��Ȩ�� profile��
 
-并且代码里对分组混合旋转增加了严格检查，确保 `T @ (T^{-T})^T ≈ I`。
+1. A�ࣨoutlier ��ѹ normal��
+- ���`--transform_search_tail_weight_mode=a_low`
+- ���壺�ͷ�λ bin Ȩ�ظ���
 
-## 3. 使用建议
+2. B�ࣨ��ֵ������
+- ���`--transform_search_tail_weight_mode=b_high`
+- ���壺�߷�λ bin Ȩ�ظ���
 
-- `--transform_search` 主要用于 weight 量化（要求 `w_bits < 16` 且 `w_granularity=group`）
-- 导出模型时，建议 `w_bits=4` 且 `a_bits=4`
-- `nvfp` 会自动修正 group size 到 16、scale precision 到 `e4m3`
-- `mxfp` 会自动修正 group size 到 32、scale precision 到 `e8m0`
+3. ���
+- ���ȣ�`--transform_search_tail_weight_mode=mixed_uniform`
+- �м���ߣ�`--transform_search_tail_weight_mode=mixed_middle`
 
-## 3.1 旋转方法对比表（含示例与效果）
+4. �Զ�A/B/��ϣ��Ƽ���
+- ���`--transform_search_tail_weight_mode=auto_abm`
+- ���壺ÿ�� group block �Զ������ֲ����� `{a_low, b_high, mixed_uniform}` ��ѡһ����
+- ���򣨵�ǰʵ�֣������ڸ� group block �� `|W|` ��λ�㣨q50/q90/q99����������ʽ�б�`auto_abm` ���� `--transform_search_objective=jtail` ʱ��Ч��
 
-> 说明：下表“效果”是 FP4 group 量化中的常见现象，不是绝对结论；最终以 `--transform_search` 实测 MSE 为准。
+���䣺`two_tail` Ϊ���ݾ�ʵ�鱣�������˶��ߣ���
 
-| 方法 | 原理（每个 group 长度为 g） | 最小示例 | 常见效果（对量化 MSE） | 代价与约束 |
-|---|---|---|---|---|
-| `identity` | `T = I`，不做特征混合。 | `g=4`，`x=[x1,x2,x3,x4]`，则 `x'=x`。 | 作为基线最稳定，但通常没有额外降误差收益。 | 开销最低，无额外约束。 |
-| `hadamard` | `T = H_g / sqrt(g)`，通过 `+1/-1` 正交基做全维度混合。 | `g=4` 时 `T = 1/2 * [[1,1,1,1],[1,-1,1,-1],[1,1,-1,-1],[1,-1,-1,1]]`。 | 对“局部极值明显/能量集中”的 group 通常有效，MSE 常明显下降。 | 开销低；工程上通常更适合 `g` 为 2 的幂。 |
-| `dct` | DCT-II 正交余弦基，把信号投影到“低频到高频”坐标。 | `g=4` 块矩阵可由 `dct(I4, type=2, norm='ortho')` 构造。 | 对平滑或相关性强的 group 往往有收益；有些层会优于 hadamard。 | 需构造稠密矩阵，开销中等。 |
-| `dst` | DST-II 正交正弦基，与 DCT 的边界特性不同。 | `g=4` 块矩阵可由 `dst(I4, type=2, norm='ortho')` 构造。 | 在部分分布下会优于 DCT；整体表现依赖具体层与 group。 | 与 DCT 类似，开销中等。 |
-| `gsr` | 基于 Hadamard，并按列的 sequency（符号变化次数）排序重排。 | `g=4` 时，列按变化次数排序为 `[col1, col3, col4, col2]`，再做 `1/sqrt(g)` 归一化。 | 在有模式结构的 group 上常比纯 Hadamard 更稳，但不保证全局最优。 | 开销低到中等；依赖 Hadamard 基构造。 |
-| `householder` | Householder 反射：`T = I - 2vv^T/(v^Tv)`，属于正交变换且 `T^{-1}=T^T=T`。 | `g=4`，取 `v=[1,2,0,0]`，可得一个 4x4 反射矩阵并对该组整体镜像反射。 | 常能在部分层上降低 MSE，尤其对方向性较强的 group；效果通常介于 `identity` 与 `hadamard/dct` 之间，需搜索判定。 | 构造开销低，矩阵稠密；需要 `v` 非零（实现中随机生成并做数值保护）。 |
-## 4. 量化 + 导出命令
+Ȩ����״�� `--transform_search_tail_weight_power` ���ƣ�>0����
 
-### 4.1 RTN + NVFP + pseudoquant 导出
+## 4. ��������˵�����ؼ���
 
-```powershell
-python model_quant.py --model_name_or_path=Qwen/Qwen3-8B --dataset_name_or_path=fineweb-edu --num_sequences=128 --sequence_length=2048 --format=nvfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group --w_observer=minmax --transform_class=identity --hadamard_group_size=128 --transform_search --transform_search_candidates identity hadamard dct dst gsr householder --export_quantized_model=pseudoquant --save_path=quantized_models/qwen3-8b-nvfp-rtn-rotate-select --cpu_offload_modules --cpu_offload_activations --fuse_global_scale --amp
+��ǰ `mse/cov/jtail/L_tail` �ļ��������ǣ�
+
+- ��ĳ�� `group_idx` ���п� `W[:, start:end]`����״ `[out_features, group_size]`���������
+- ��ͬһ��λ�����Ĳ�����ͣ����� qkv ��� q/k/v ͬһ `group_idx` �ۼӣ�
+
+������ǡ��� group �п���ߡ������� `rows*cols/group_size` ����Ԫ�ر���������
+
+## 5. ·��Ĭ����Ϊ��objective=auto��
+
+- GPTQ ·����`--gptq`����`auto -> cov`
+- RTN ·������ `--gptq`����`auto -> mse`
+
+��Ŀ����Ҫ `cov`��`cov` �� `jtail+base=cov`��ʱ�����Զ��ռ� `group_covariances`��
+
+## 6. ����˵��
+
+- `--transform_search_objective {auto,mse,cov,jtail}`
+- `--transform_search_base_loss {mse,cov}`���� `jtail` ʹ�ã�
+- `--transform_search_tail_lambda <float>`
+- `--transform_search_tail_bins <int>`
+- `--transform_search_tail_weight_mode {a_low,b_high,mixed_uniform,mixed_middle,two_tail,auto_abm}`
+- `--transform_search_tail_weight_power <float>`
+
+## 7. �ն���־
+
+������־���ӡĿ����Э����״̬�����磺
+
+```text
+[transform_search] objective=J_tail(base=cov,lambda=0.2,bins=4,weights=auto_abm,power=2) | group_covariances=enabled(qkv=256,o=256,gate_up=256,down=896) | qkv=... | tail_mode=a_low:120,b_high:45,mixed_uniform:91
 ```
 
-#### 4.1.1 参数解释（与上面命令一一对应）
+GPTQ �������־��
 
-- `python model_quant.py`：运行主量化脚本。
-- `--model_name_or_path=Qwen/Qwen3-8B`：待量化基座模型。
-- `--dataset_name_or_path=fineweb-edu`：校准数据集名称或路径。
-- `--num_sequences=128`：用于校准的样本条数。
-- `--sequence_length=2048`：每条校准样本的 token 长度。
-- `--format=nvfp`：使用 NVFP4 路径。
-- `--w_bits=4`：权重量化到 4bit。
-- `--a_bits=4`：激活量化到 4bit。
-- `--w_granularity=group`：权重按 group 统计量化参数（transform_search 必需）。
-- `--a_granularity=group`：激活按 group 统计量化参数。
-- `--w_observer=minmax`：权重量化参数观测器为 min-max。
-- `--transform_class=identity`：基础 transform 选项；在 `--transform_search` 开启时不参与搜索决策，仅作兼容保留。
-- `--hadamard_group_size=128`：传统 transform 的分组参数；在当前 per-group 搜索中，搜索粒度由 `w_group_size` 决定（NVFP 下自动为 16）。
-- `--transform_search`：开启按 group 搜索旋转算法（GPTQ 路径使用 GPTQ 一致目标；RTN 路径回退到 MSE 目标）。
-- `--transform_search_candidates identity hadamard dct dst gsr householder`：搜索候选算法集合（已包含 householder）。
-- `--export_quantized_model=pseudoquant`：导出 pseudoquant 权重。
-- `--save_path=...`：导出目录。
-- `--cpu_offload_modules`：模块计算阶段可在 CPU/GPU 间搬运，降低显存占用。
-- `--cpu_offload_activations`：中间激活可下放 CPU，进一步省显存。
-- `--fuse_global_scale`：融合 qkv 与 gate/up 的全局 scale（该项在 NVFP 的 `e4m3` 路径有效）。
-- `--amp`：启用 autocast 混合精度以减少显存并提速部分步骤。
-
-### 4.2 GPTQ + MXFP + realquant 导出
-
-```powershell
-python model_quant.py --model_name_or_path=meta-llama/Llama-3.1-8B-Instruct --dataset_name_or_path=fineweb-edu --num_sequences=128 --sequence_length=2048 --format=mxfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group --w_observer=minmax --gptq --quantization_order=default --rel_damp=1e-2 --transform_class=identity --hadamard_group_size=128 --transform_search --transform_search_candidates identity hadamard dct dst gsr householder --export_quantized_model=realquant --save_path=quantized_models/llama31-8b-mxfp-gptq-rotate-select --cpu_offload_modules --cpu_offload_activations --fuse_global_scale --amp
+```text
+[self_attn.q_proj]: Relative Hessian error: 1.23e-03
 ```
 
-#### 4.2.1 参数解释（与上面命令一一对应）
+## 8. ����ʾ��
 
-- `python model_quant.py`：运行主量化脚本。
-- `--model_name_or_path=meta-llama/Llama-3.1-8B-Instruct`：待量化基座模型。
-- `--dataset_name_or_path=fineweb-edu`：校准数据集名称或路径。
-- `--num_sequences=128`：用于校准的样本条数。
-- `--sequence_length=2048`：每条校准样本长度。
-- `--format=mxfp`：使用 MXFP4 路径。
-- `--w_bits=4`：权重量化到 4bit。
-- `--a_bits=4`：激活量化到 4bit。
-- `--w_granularity=group`：权重按 group 统计量化参数（transform_search 必需）。
-- `--a_granularity=group`：激活按 group 统计量化参数。
-- `--w_observer=minmax`：权重量化参数观测器为 min-max。
-- `--gptq`：使用 GPTQ 量化流程（不加该参数则走 RTN）。
-- `--quantization_order=default`：GPTQ 列处理顺序为默认顺序。
-- `--rel_damp=1e-2`：GPTQ Hessian 正则阻尼系数。
-- `--transform_class=identity`：基础 transform 选项；在 `--transform_search` 开启时不参与搜索决策，仅作兼容保留。
-- `--hadamard_group_size=128`：传统 transform 分组参数；当前 per-group 搜索时，搜索粒度由 `w_group_size` 决定（MXFP 下自动为 32）。
-- `--transform_search`：开启按 group 搜索旋转算法（在 GPTQ 路径下使用 GPTQ 一致目标）。
-- `--transform_search_candidates identity hadamard dct dst gsr householder`：候选旋转算法（已包含 householder）。
-- `--export_quantized_model=realquant`：导出 realquant 权重。
-- `--save_path=...`：导出目录。
-- `--cpu_offload_modules`：模块 offload 以降低显存峰值。
-- `--cpu_offload_activations`：激活 offload 以降低显存峰值。
-- `--fuse_global_scale`：该参数仅在 `scale_precision=e4m3`（NVFP）分支会生效；对本命令（MXFP -> `e8m0`）通常无实际作用。
-- `--amp`：启用 autocast 混合精度。
+### 8.1 GPTQ + J_tail��A�ࣺ�ͷ�λ���ߣ�
 
-## 5. 命令隐式行为（由脚本自动修正）
+```bash
+python model_quant.py \
+  --model_name_or_path=/cephfs/shared/model/llama-3-8b-instruct \
+  --dataset_name_or_path=${OUT_CALIB}/fineweb_calib_1024x2048_tokens.pt \
+  --num_sequences=128 --sequence_length=2048 --dtype=auto \
+  --format=nvfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group \
+  --w_group_size=16 --a_group_size=16 --w_observer=mse \
+  --gptq --quantization_order=default \
+  --transform_search --transform_search_objective=jtail --transform_search_base_loss=cov \
+  --transform_search_tail_lambda=0.2 --transform_search_tail_bins=4 \
+  --transform_search_tail_weight_mode=a_low --transform_search_tail_weight_power=2.0 \
+  --transform_search_candidates identity hadamard dct dst gsr householder \
+  --export_quantized_model=pseudoquant --save_path=outputs/nvfp_gptq_jtail_a_low \
+  --fuse_global_scale --amp
+```
 
-- 当 `--format=nvfp`：
-  - `w_group_size` 自动改为 `16`
-  - `a_group_size` 自动改为 `16`
-  - `scale_precision` 自动改为 `e4m3`
-- 当 `--format=mxfp`：
-  - `w_group_size` 自动改为 `32`
-  - `a_group_size` 自动改为 `32`
-  - `scale_precision` 自动改为 `e8m0`
+### 8.2 GPTQ + J_tail��B�ࣺ�߷�λ���ߣ�
 
-## 6. 常见问题
+```bash
+python model_quant.py \
+  --model_name_or_path=/cephfs/shared/model/llama-3-8b-instruct \
+  --dataset_name_or_path=${OUT_CALIB}/fineweb_calib_1024x2048_tokens.pt \
+  --num_sequences=128 --sequence_length=2048 --dtype=auto \
+  --format=mxfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group \
+  --w_group_size=32 --a_group_size=32 --w_observer=mse \
+  --gptq --quantization_order=default \
+  --transform_search --transform_search_objective=jtail --transform_search_base_loss=cov \
+  --transform_search_tail_lambda=0.2 --transform_search_tail_bins=4 \
+  --transform_search_tail_weight_mode=b_high --transform_search_tail_weight_power=2.0 \
+  --transform_search_candidates identity hadamard dct dst gsr householder \
+  --export_quantized_model=pseudoquant --save_path=outputs/mxfp_gptq_jtail_b_high \
+  --fuse_global_scale --amp
+```
 
-- 如果某个候选旋转依赖不可用或矩阵不可逆，会在搜索时自动跳过。
-- 如果未安装依赖（如 `safetensors` / `transformers`），请先安装后再运行导出。
+### 8.3 RTN + J_tail����ϣ����ȣ�
+
+```bash
+python model_quant.py \
+  --model_name_or_path=/cephfs/shared/model/llama-3-8b-instruct \
+  --dataset_name_or_path=${OUT_CALIB}/fineweb_calib_1024x2048_tokens.pt \
+  --num_sequences=128 --sequence_length=2048 --dtype=auto \
+  --format=nvfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group \
+  --w_group_size=16 --a_group_size=16 --w_observer=minmax \
+  --transform_search --transform_search_objective=jtail --transform_search_base_loss=mse \
+  --transform_search_tail_lambda=0.1 --transform_search_tail_bins=4 \
+  --transform_search_tail_weight_mode=mixed_uniform --transform_search_tail_weight_power=2.0 \
+  --transform_search_candidates identity hadamard dct dst gsr householder \
+  --export_quantized_model=pseudoquant --save_path=outputs/nvfp_rtn_jtail_mixed_uniform \
+  --fuse_global_scale --amp
+```
+
+### 8.4 GPTQ + J_tail���Զ�A/B/��ϣ�
+
+```bash
+python model_quant.py \
+  --model_name_or_path=/cephfs/shared/model/llama-3-8b-instruct \
+  --dataset_name_or_path=${OUT_CALIB}/fineweb_calib_1024x2048_tokens.pt \
+  --num_sequences=128 --sequence_length=2048 --dtype=auto \
+  --format=nvfp --w_bits=4 --a_bits=4 --w_granularity=group --a_granularity=group \
+  --w_group_size=16 --a_group_size=16 --w_observer=mse \
+  --gptq --quantization_order=default \
+  --transform_search --transform_search_objective=jtail --transform_search_base_loss=cov \
+  --transform_search_tail_lambda=0.2 --transform_search_tail_bins=4 \
+  --transform_search_tail_weight_mode=auto_abm --transform_search_tail_weight_power=2.0 \
+  --transform_search_candidates identity hadamard dct dst gsr householder \
+  --export_quantized_model=pseudoquant --save_path=outputs/nvfp_gptq_jtail_auto_abm \
+  --fuse_global_scale --amp
+```
+## 9. ���� scale ����
+
+scale ��������δ�ģ����� observer ������
+
+- `--w_observer=minmax`��min-max
+- `--w_observer=mse`��������� scale ������ʵ����Ϊ `|x-x_q|^2.4`��
+
+Ҳ����˵���������ǡ���ת����Ŀ����β��Ȩ�ز��ԡ������ǰ� scale �����ĳ� COV��
+
+
 
 
 
