@@ -189,3 +189,4 @@ env_var.sh
 /oyzl_test/torch_home/
 /oyzl_test/xdg_cache/
 /oyzl_test/outputs/
+/oyzl_test/outputs-COV/
