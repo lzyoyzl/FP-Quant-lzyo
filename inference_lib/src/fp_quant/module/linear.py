@@ -151,6 +151,105 @@ class FPQuantLinear(nn.Module):
             ),
         )
 
+
+        # New: track pseudoquant checkpoint integrity across sharded loading.
+        # HF may stream state_dict in multiple passes, so we cannot validate all keys in one call.
+        self._fpq_seen_state_keys = set()
+        self._fpq_runtime_state_validated = False
+        self._fpq_loaded_from_state_dict = False
+
+    def _validate_transform_matrix_shape(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+    ) -> list[str]:
+        errors = []
+        if tensor.ndim == 2:
+            if tensor.shape[0] != tensor.shape[1]:
+                errors.append(
+                    f"{name} must be square when 2D, got shape={tuple(tensor.shape)}."
+                )
+            elif self.in_features % tensor.shape[0] != 0:
+                errors.append(
+                    f"{name} 2D size {tensor.shape[0]} must divide in_features={self.in_features}."
+                )
+        elif tensor.ndim == 3:
+            num_groups, group_size_r, group_size_c = tensor.shape
+            if group_size_r != group_size_c:
+                errors.append(
+                    f"{name} group blocks must be square, got shape={tuple(tensor.shape)}."
+                )
+            elif num_groups * group_size_r != self.in_features:
+                errors.append(
+                    f"{name} shape={tuple(tensor.shape)} is incompatible with in_features={self.in_features}."
+                )
+        else:
+            errors.append(
+                f"{name} must be 2D or 3D, got ndim={tensor.ndim}, shape={tuple(tensor.shape)}."
+            )
+        return errors
+
+    def _validate_pseudoquant_runtime_state(self) -> list[str]:
+        errors = []
+        required_keys = {
+            "dqweight",
+            "forward_hadamard_matrix",
+            "backward_hadamard_matrix",
+            "weight_global_scale",
+            "act_global_scale",
+        }
+
+        # If at least one key has been loaded from checkpoint, require all pseudoquant keys.
+        if len(self._fpq_seen_state_keys) > 0:
+            missing_keys = sorted(required_keys - self._fpq_seen_state_keys)
+            if missing_keys:
+                errors.append(f"missing pseudoquant checkpoint keys: {missing_keys}")
+
+        if self.dqweight is None:
+            errors.append("dqweight is None for pseudoquant no-master path.")
+        else:
+            expected_shape = (self.out_features, self.in_features)
+            if tuple(self.dqweight.shape) != expected_shape:
+                errors.append(
+                    f"dqweight shape mismatch: got {tuple(self.dqweight.shape)}, expected {expected_shape}."
+                )
+            elif not torch.isfinite(self.dqweight).all():
+                errors.append("dqweight contains NaN/Inf.")
+
+        errors.extend(
+            self._validate_transform_matrix_shape(
+                self.forward_hadamard_matrix, "forward_hadamard_matrix"
+            )
+        )
+        errors.extend(
+            self._validate_transform_matrix_shape(
+                self.backward_hadamard_matrix, "backward_hadamard_matrix"
+            )
+        )
+
+        if tuple(self.forward_hadamard_matrix.shape) != tuple(self.backward_hadamard_matrix.shape):
+            errors.append(
+                "forward_hadamard_matrix and backward_hadamard_matrix shape mismatch: "
+                f"{tuple(self.forward_hadamard_matrix.shape)} vs {tuple(self.backward_hadamard_matrix.shape)}."
+            )
+
+        if not torch.isfinite(self.forward_hadamard_matrix).all():
+            errors.append("forward_hadamard_matrix contains NaN/Inf.")
+        if not torch.isfinite(self.backward_hadamard_matrix).all():
+            errors.append("backward_hadamard_matrix contains NaN/Inf.")
+
+        if self.weight_global_scale is None or self.weight_global_scale.numel() < 1:
+            errors.append("weight_global_scale is missing or empty.")
+        elif not torch.isfinite(self.weight_global_scale).all():
+            errors.append("weight_global_scale contains NaN/Inf.")
+
+        if self.act_global_scale is None or self.act_global_scale.numel() < 1:
+            errors.append("act_global_scale is missing or empty.")
+        elif not torch.isfinite(self.act_global_scale).all():
+            errors.append("act_global_scale contains NaN/Inf.")
+
+        return errors
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -164,6 +263,18 @@ class FPQuantLinear(nn.Module):
         # Original code assumed [hadamard_group_size, hadamard_group_size] buffers.
         # New: allow loading exported checkpoints that store per-group transform banks
         # (e.g. [num_groups, group_size, group_size]) by resizing placeholder buffers.
+        required_pseudoquant_keys = (
+            "dqweight",
+            "forward_hadamard_matrix",
+            "backward_hadamard_matrix",
+            "weight_global_scale",
+            "act_global_scale",
+        )
+        for key_name in required_pseudoquant_keys:
+            key = prefix + key_name
+            if key in state_dict:
+                self._fpq_seen_state_keys.add(key_name)
+
         for buffer_name in ("forward_hadamard_matrix", "backward_hadamard_matrix"):
             key = prefix + buffer_name
             if key in state_dict:
@@ -171,6 +282,23 @@ class FPQuantLinear(nn.Module):
                 current = self._buffers.get(buffer_name, None)
                 if current is None or tuple(current.shape) != tuple(incoming.shape):
                     self._buffers[buffer_name] = torch.empty_like(incoming)
+                # New: validate incoming matrix shape early for clearer checkpoint errors.
+                incoming_errors = self._validate_transform_matrix_shape(incoming, buffer_name)
+                for err in incoming_errors:
+                    error_msgs.append(f"{prefix}{err}")
+                if not torch.isfinite(incoming).all():
+                    error_msgs.append(f"{key} contains NaN/Inf in checkpoint.")
+
+        dqweight_key = prefix + "dqweight"
+        if dqweight_key in state_dict:
+            incoming_dqweight = state_dict[dqweight_key]
+            expected_shape = (self.out_features, self.in_features)
+            if tuple(incoming_dqweight.shape) != expected_shape:
+                error_msgs.append(
+                    f"{dqweight_key} shape mismatch: got {tuple(incoming_dqweight.shape)}, expected {expected_shape}."
+                )
+            if not torch.isfinite(incoming_dqweight).all():
+                error_msgs.append(f"{dqweight_key} contains NaN/Inf in checkpoint.")
 
         super()._load_from_state_dict(
             state_dict,
@@ -181,25 +309,28 @@ class FPQuantLinear(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        self._fpq_loaded_from_state_dict = True
 
 
     @torch.no_grad()
     def pre_forward(self):
-        # ===== [新增] 1) 如果是导出的 pseudoquant checkpoint：dqweight 已经�?state_dict �?=====
-        # 这种情况下不需要（也不允许）再�?master weight 触发 pseudoquant 过程�?        # 否则会在 CPU 上触�?Triton 或覆盖已加载�?dqweight�?        
+        # 1) For exported pseudoquant checkpoints (no-master), dqweight is already loaded.
+        # Skip runtime pseudoquantization from master weights to avoid CPU/Triton issues
+        # and to preserve the loaded dqweight tensors.
         if self.config.pseudoquantization and (not self.config.store_master_weights):
             if getattr(self, "dqweight", None) is not None:
-                # 确保不保�?不依�?master weight 路径
+                # Force no-master inference path.
                 self.weight = None
                 self.qweight = None
                 self.scales = None
                 setattr(self, "_fpq_deferred_pre_forward", False)
                 return
 
-        # ===== [新增] 2) 若需要从 weight 生成量化参数，但当前不在 CUDA/XPU，则延迟 =====
-        # 注意：pseudoquant �?Triton kernel 只能�?CUDA/XPU 上跑�?        
+        # 2) If quant params must be generated from self.weight but weight is not on CUDA/XPU,
+        # defer pre_forward until first GPU activation arrives.
         if getattr(self, "weight", None) is None:
-            # 这里一般只会出现在不完�?不匹配的 checkpoint；先标记延迟，forward 时再报更明确的错
+            # Usually indicates an incomplete or mismatched checkpoint; keep deferred flag
+            # so forward() can raise a clearer error later.
             setattr(self, "_fpq_deferred_pre_forward", True)
             return
 
@@ -210,7 +341,7 @@ class FPQuantLinear(nn.Module):
 
         setattr(self, "_fpq_deferred_pre_forward", False)
 
-        # ===== 下面保持你原来的逻辑不变 =====
+        # Keep original pre_forward logic below.
         assert (
             self.weight.shape[1] % self.config.hadamard_group_size == 0
         ), f"Weight shape must be divisible by hadamard group size: {self.weight.shape[1]} % {self.config.hadamard_group_size} = {self.weight.shape[1] % self.config.hadamard_group_size}"
@@ -304,6 +435,35 @@ class FPQuantLinear(nn.Module):
 
 
     def forward(self, x) -> torch.Tensor:
+        # New: fail fast if pseudoquant no-master state is partially loaded / malformed.
+        if (
+            self.config.pseudoquantization
+            and not self.config.store_master_weights
+            and not self._fpq_runtime_state_validated
+        ):
+            runtime_errors = self._validate_pseudoquant_runtime_state()
+            # For non-checkpoint path, only enforce pre_forward requirement when not deferred.
+            if (
+                len(self._fpq_seen_state_keys) == 0
+                and self.weight is not None
+                and self.dqweight is not None
+                and not getattr(self, "_fpq_deferred_pre_forward", False)
+            ):
+                runtime_errors.append(
+                    "pseudoquant no-master layer is not checkpoint-loaded and still has master weight; "
+                    "call pre_forward() before inference or load a valid pseudoquant checkpoint."
+                )
+            # If pre_forward is intentionally deferred to first CUDA/XPU activation,
+            # skip strict state validation until deferred pre_forward is finalized.
+            if len(self._fpq_seen_state_keys) == 0 and getattr(self, "_fpq_deferred_pre_forward", False):
+                runtime_errors = []
+            if runtime_errors:
+                raise ValueError(
+                    "FPQuantLinear pseudoquant state validation failed: "
+                    + " | ".join(runtime_errors)
+                )
+            self._fpq_runtime_state_validated = True
+
         # Deferred pre_forward is finalized once activations are on CUDA/XPU.
         if getattr(self, "_fpq_deferred_pre_forward", False):
             if x.device.type in ["cuda", "xpu"]:
@@ -320,8 +480,7 @@ class FPQuantLinear(nn.Module):
                     f"(current device: {dev}). Ensure the model is placed on GPU via device_map "
                     f"and do not offload FPQuant modules to CPU."
                 )
-
-        # ===== 下面保持你原来的分支不变 =====
+        # Keep original forward branches below.
         if (
             self.config.forward_dtype == FPQuantDtype.MXFP4
             and self.config.backward_dtype == FPQuantDtype.MXFP4
@@ -441,6 +600,7 @@ class FPQuantLinear(nn.Module):
                 f"Forward dtype: {self.config.forward_dtype}, backward dtype: {self.config.backward_dtype}, "
                 f"store_master_weights: {self.config.store_master_weights}, pseudoquantization: {self.config.pseudoquantization} isn't supported yet."
             )
+
 
 
 
