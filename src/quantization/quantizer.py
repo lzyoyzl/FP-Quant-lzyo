@@ -115,16 +115,22 @@ class Quantizer:
             zeros = -(x_min / scales).round()
 
         if self.observer == QuantizationObserver.MSE:
-            init_scales = scales.clone() 
-            best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
+            init_scales = scales.clone()
+            # Original implementation kept for reference (requested):
+            # best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
+            # Keep MSE search error buffers in float32 to avoid Half/Float assignment mismatch.
+            best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=torch.float32)
 
             for i in range(scale_search_iters):
                 scale_shrink_factor = 1 - i * max_scale_shrink_factor / scale_search_iters
                 candidate_scales = scale_shrink_factor * init_scales
-                candidate_zeros = torch.zeros_like(x_min) if self.symmetric else -(x_min / candidate_scales).round() 
+                candidate_zeros = torch.zeros_like(x_min) if self.symmetric else -(x_min / candidate_scales).round()
                 q = self.quant_fn(x, candidate_scales, candidate_zeros, self.q_min, self.q_max)
                 x_reconstructed = self.dequant_fn(q, candidate_scales, candidate_zeros)
-                quantization_error = (x - x_reconstructed).abs_().pow_(error_norm).sum(dim=-1)
+                # Original implementation kept for reference (requested):
+                # quantization_error = (x - x_reconstructed).abs_().pow_(error_norm).sum(dim=-1)
+                # Force float32 for stable comparison/assignment with best_quantization_error.
+                quantization_error = (x - x_reconstructed).to(torch.float32).abs_().pow_(error_norm).sum(dim=-1)
 
                 if (quantization_error < best_quantization_error).any():
                     improved_ids = torch.where(quantization_error < best_quantization_error)
@@ -132,7 +138,6 @@ class Quantizer:
                     scales[improved_ids] = candidate_scales[improved_ids]
                     if not self.symmetric:
                         zeros[improved_ids] = candidate_zeros[improved_ids]
-
         # Reshape back
         if self.group_size:
             x = x.flatten(dim, dim + 1)
