@@ -19,10 +19,11 @@ from .transform_search import (
     format_transform_summary,
     get_export_transform_matrices,
     should_collect_group_covariances,
-    resolve_transform_search_objective,
+    should_collect_input_samples,
+    resolve_transform_search_config,
     format_transform_search_objective,
 )
-from .gptq import collect_block_slot_input_covariances
+from .gptq import collect_block_slot_input_covariances, collect_block_slot_input_samples
 
 
 def rtn_quantization(
@@ -40,7 +41,13 @@ def rtn_quantization(
         base_loss=getattr(args, "transform_search_base_loss", "cov"),
         auto_default="mse",
     )
-    need_block_inputs = need_calibration or need_transform_covariances
+    need_transform_input_samples = bool(getattr(args, "transform_search", False)) and should_collect_input_samples(
+        objective=getattr(args, "transform_search_objective", "auto"),
+        base_loss=getattr(args, "transform_search_base_loss", "cov"),
+        tail_source=getattr(args, "transform_search_tail_source", "weight"),
+        auto_default="mse",
+    )
+    need_block_inputs = need_calibration or need_transform_covariances or need_transform_input_samples
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
@@ -106,12 +113,22 @@ def rtn_quantization(
         # down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)
         # New path: optionally run per-group transform search to minimize quantization MSE.
         slot_input_covariances = None
+        slot_input_samples = None
         if need_transform_covariances:
             slot_input_covariances = collect_block_slot_input_covariances(
                 block=block,
                 input_args=input_args,
                 input_kwargs=input_kwargs,
                 group_size=args.w_group_size,
+                device=device,
+                amp_enabled=args.amp,
+            )
+        if need_transform_input_samples:
+            slot_input_samples = collect_block_slot_input_samples(
+                block=block,
+                input_args=input_args,
+                input_kwargs=input_kwargs,
+                max_rows=int(getattr(args, "transform_search_act_sample_size", 1024)),
                 device=device,
                 amp_enabled=args.amp,
             )
@@ -124,13 +141,16 @@ def rtn_quantization(
             device=device,
             transform_kwargs=transform_kwargs,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
+            act_quantizer_kwargs=act_quantizer_kwargs,
             slot_input_covariances=slot_input_covariances,
+            slot_input_samples=slot_input_samples,
             auto_default_objective="mse",
         )
         if args.transform_search:
-            resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+            resolved_objective, resolved_base_loss, resolved_tail_source = resolve_transform_search_config(
                 objective=getattr(args, "transform_search_objective", "auto"),
                 base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                tail_source=getattr(args, "transform_search_tail_source", "weight"),
                 has_group_covariances=slot_input_covariances is not None,
                 auto_default="mse",
             )
@@ -139,6 +159,7 @@ def rtn_quantization(
                 base_loss=resolved_base_loss,
                 tail_lambda=float(getattr(args, "transform_search_tail_lambda", 0.0)),
                 tail_bins=int(getattr(args, "transform_search_tail_bins", 4)),
+                tail_source=(resolved_tail_source or "weight"),
                 tail_weight_mode=str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform")),
                 tail_weight_power=float(getattr(args, "transform_search_tail_weight_power", 2.0)),
             )
@@ -151,9 +172,19 @@ def rtn_quantization(
                     f"gate_up={slot_input_covariances['gate_up'].shape[0]},"
                     f"down={slot_input_covariances['down'].shape[0]})"
                 )
+            if slot_input_samples is None:
+                act_tag = "disabled"
+            else:
+                act_tag = (
+                    f"enabled(qkv={slot_input_samples['qkv'].shape[0]},"
+                    f"o={slot_input_samples['o'].shape[0]},"
+                    f"gate_up={slot_input_samples['gate_up'].shape[0]},"
+                    f"down={slot_input_samples['down'].shape[0]})"
+                )
             print(
                 f"  [transform_search] objective={objective_tag} | "
                 f"group_covariances={cov_tag} | "
+                f"act_samples={act_tag} | "
                 f"qkv={format_transform_summary(qkv_in_transform)} | "
                 f"o={format_transform_summary(o_in_transform)} | "
                 f"gate_up={format_transform_summary(gate_up_in_transform)} | "

@@ -11,9 +11,11 @@ from ..transforms.transforms import BaseTransform, build_transform, get_transfor
 # We keep the default search space focused on practical transforms for FP4 group quantization.
 DEFAULT_SEARCH_TRANSFORMS = ["identity", "hadamard", "dct", "dst", "gsr", "householder"]
 SUPPORTED_SEARCH_TRANSFORMS = {"identity", "hadamard", "dct", "dst", "gsr", "householder", "fast_food"}
-SUPPORTED_SEARCH_OBJECTIVES = {"auto", "mse", "cov", "jtail"}
-SUPPORTED_SEARCH_BASE_LOSSES = {"mse", "cov"}
+SUPPORTED_SEARCH_OBJECTIVES = {"auto", "mse", "cov", "jtail", "act_mse"}
+SUPPORTED_SEARCH_BASE_LOSSES = {"mse", "cov", "act_mse"}
+SUPPORTED_TAIL_SOURCES = {"weight", "activation"}
 SUPPORTED_TAIL_WEIGHT_MODES = {"a_low", "b_high", "mixed_uniform", "mixed_middle", "two_tail", "auto_abm"}
+ADAPTIVE_GROUP_TRANSFORMS = {"householder"}
 
 
 class MixedGroupTransform(BaseTransform):
@@ -201,20 +203,20 @@ def _build_tail_bin_weights(
 
 
 def _select_tail_weight_mode_for_group(
-    group_weights: Sequence[torch.Tensor],
+    group_tensors: Sequence[torch.Tensor],
 ) -> str:
     """
-    Auto-select A/B/mixed mode from group-block distribution.
+    Auto-select A/B/mixed mode from a group-block distribution.
 
-    Heuristic (based on |W_g| quantiles):
+    Heuristic (based on |tensor_g| quantiles):
     - A-type (a_low): sharp outliers above already-high values.
     - B-type (b_high): high values dominate most of the block.
     - Mixed: fallback.
     """
-    if len(group_weights) == 0:
+    if len(group_tensors) == 0:
         return "mixed_uniform"
 
-    merged = torch.cat([w.reshape(-1).abs().to(torch.float32) for w in group_weights], dim=0)
+    merged = torch.cat([t.reshape(-1).abs().to(torch.float32) for t in group_tensors], dim=0)
     if merged.numel() == 0:
         return "mixed_uniform"
 
@@ -235,8 +237,8 @@ def _select_tail_weight_mode_for_group(
 
 
 def _compute_tail_quantile_error(
-    delta_w: torch.Tensor,
-    reference_weight: torch.Tensor,
+    delta: torch.Tensor,
+    reference_tensor: torch.Tensor,
     tail_bins: int,
     tail_weight_mode: str,
     tail_weight_power: float,
@@ -244,13 +246,13 @@ def _compute_tail_quantile_error(
     """
     Quantile tail term:
         L_tail = sum_b alpha_b * MSE_b
-    where bins are formed on |reference_weight| quantiles.
+    where bins are formed on |reference_tensor| quantiles.
     """
     if tail_bins <= 1:
-        return delta_w.pow(2).mean().item()
+        return delta.pow(2).mean().item()
 
-    sq_err = delta_w.pow(2).reshape(-1).to(torch.float32)
-    abs_ref = reference_weight.abs().reshape(-1).to(torch.float32)
+    sq_err = delta.pow(2).reshape(-1).to(torch.float32)
+    abs_ref = reference_tensor.abs().reshape(-1).to(torch.float32)
     if sq_err.numel() == 0:
         return 0.0
 
@@ -283,12 +285,120 @@ def _compute_tail_quantile_error(
     return (weighted / normalizer.clamp_min(1e-12)).item()
 
 
+def _build_householder_from_energy(energy: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Build a per-group Householder reflection from channel RMS energy.
+
+    The reflection maps the normalized energy direction toward the uniform
+    direction, giving a low-cost data-adaptive candidate that tends to spread
+    concentrated channel energy/outliers.
+    """
+    if energy.ndim != 1:
+        raise ValueError(f"householder energy must be 1-D, got shape {tuple(energy.shape)}.")
+
+    energy = energy.to(dtype=torch.float32)
+    energy = torch.where(torch.isfinite(energy), energy.abs(), torch.zeros_like(energy))
+    group_size = energy.numel()
+    eye = torch.eye(group_size, device=energy.device, dtype=torch.float32)
+
+    norm = torch.linalg.vector_norm(energy)
+    if norm <= eps:
+        return eye
+
+    source_direction = energy / norm
+    target_direction = torch.ones_like(source_direction) / (float(group_size) ** 0.5)
+    reflector_direction = source_direction - target_direction
+    reflector_norm_sq = torch.dot(reflector_direction, reflector_direction)
+    if reflector_norm_sq <= eps:
+        return eye
+
+    return eye - 2.0 * torch.outer(reflector_direction, reflector_direction) / reflector_norm_sq
+
+
+def _compute_weight_group_energy(
+    weights: Sequence[torch.Tensor],
+    start: int,
+    end: int,
+    device: torch.device,
+) -> torch.Tensor:
+    accum: torch.Tensor | None = None
+    row_count = 0
+    for weight in weights:
+        group_weight = weight[:, start:end].to(device=device, dtype=torch.float32)
+        group_energy = group_weight.pow(2).sum(dim=0)
+        accum = group_energy if accum is None else accum + group_energy
+        row_count += group_weight.shape[0]
+
+    if accum is None or row_count == 0:
+        return torch.zeros(end - start, device=device, dtype=torch.float32)
+    return (accum / row_count).clamp_min(0.0).sqrt()
+
+
+def _compute_activation_group_energy(group_inputs: torch.Tensor) -> torch.Tensor:
+    return group_inputs.to(dtype=torch.float32).pow(2).mean(dim=0).clamp_min(0.0).sqrt()
+
+
+def _compute_covariance_group_energy(
+    group_covariances: Sequence[torch.Tensor],
+    group_idx: int,
+    device: torch.device,
+) -> torch.Tensor:
+    accum: torch.Tensor | None = None
+    count = 0
+    for covariances in group_covariances:
+        covariance = covariances[group_idx].to(device=device, dtype=torch.float32)
+        diag_energy = covariance.diagonal(dim1=-2, dim2=-1).clamp_min(0.0)
+        accum = diag_energy if accum is None else accum + diag_energy
+        count += 1
+
+    if accum is None or count == 0:
+        raise ValueError("Adaptive Householder with cov objective requires group covariances.")
+    return (accum / count).clamp_min(0.0).sqrt()
+
+
+def _build_adaptive_householder_for_group(
+    weights: Sequence[torch.Tensor],
+    start: int,
+    end: int,
+    device: torch.device,
+    resolved_objective: str,
+    resolved_base_loss: str,
+    resolved_tail_source: str | None,
+    group_covariances: Sequence[torch.Tensor] | None,
+    group_idx: int,
+    group_inputs: torch.Tensor | None,
+) -> torch.Tensor:
+    if resolved_objective == "act_mse":
+        if group_inputs is None:
+            raise ValueError("Adaptive Householder with act_mse objective requires activation samples.")
+        energy = _compute_activation_group_energy(group_inputs)
+    elif resolved_objective == "cov":
+        if group_covariances is None:
+            raise ValueError("Adaptive Householder with cov objective requires group covariances.")
+        energy = _compute_covariance_group_energy(group_covariances, group_idx, device)
+    elif resolved_objective == "jtail" and resolved_tail_source == "activation":
+        if group_inputs is None:
+            raise ValueError("Adaptive Householder with activation tail requires activation samples.")
+        energy = _compute_activation_group_energy(group_inputs)
+    else:
+        # mse and weight-tail jtail use the local weight distribution.
+        energy = _compute_weight_group_energy(weights, start, end, device)
+
+    return _build_householder_from_energy(energy.to(device=device, dtype=torch.float32))
+
+
+def _resolve_requested_objective(objective: str, auto_default: str) -> str:
+    if auto_default not in {"mse", "cov"}:
+        raise ValueError(f"auto_default must be 'mse' or 'cov', got '{auto_default}'.")
+    return auto_default if objective == "auto" else objective
+
+
 def should_collect_group_covariances(
     objective: str,
     base_loss: str,
     auto_default: str,
 ) -> bool:
-    resolved_objective = auto_default if objective == "auto" else objective
+    resolved_objective = _resolve_requested_objective(objective, auto_default)
     if resolved_objective == "cov":
         return True
     if resolved_objective == "jtail" and base_loss == "cov":
@@ -296,12 +406,27 @@ def should_collect_group_covariances(
     return False
 
 
-def resolve_transform_search_objective(
+def should_collect_input_samples(
     objective: str,
     base_loss: str,
+    tail_source: str,
+    auto_default: str,
+) -> bool:
+    resolved_objective = _resolve_requested_objective(objective, auto_default)
+    if resolved_objective == "act_mse":
+        return True
+    if resolved_objective == "jtail" and (base_loss == "act_mse" or tail_source == "activation"):
+        return True
+    return False
+
+
+def resolve_transform_search_config(
+    objective: str,
+    base_loss: str,
+    tail_source: str,
     has_group_covariances: bool,
     auto_default: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     if objective not in SUPPORTED_SEARCH_OBJECTIVES:
         raise ValueError(
             f"Unsupported transform_search objective '{objective}'. "
@@ -312,16 +437,52 @@ def resolve_transform_search_objective(
             f"Unsupported transform_search base loss '{base_loss}'. "
             f"Supported: {sorted(SUPPORTED_SEARCH_BASE_LOSSES)}"
         )
-    if auto_default not in {"mse", "cov"}:
-        raise ValueError(f"auto_default must be 'mse' or 'cov', got '{auto_default}'.")
+    if tail_source not in SUPPORTED_TAIL_SOURCES:
+        raise ValueError(
+            f"Unsupported transform_search tail source '{tail_source}'. "
+            f"Supported: {sorted(SUPPORTED_TAIL_SOURCES)}"
+        )
 
-    resolved_objective = auto_default if objective == "auto" else objective
-    resolved_base_loss = base_loss if resolved_objective == "jtail" else resolved_objective
+    resolved_objective = _resolve_requested_objective(objective, auto_default)
+    if resolved_objective == "jtail":
+        resolved_base_loss = base_loss
+        resolved_tail_source: str | None = tail_source
+    else:
+        resolved_base_loss = resolved_objective
+        resolved_tail_source = None
+
+    if resolved_objective == "jtail":
+        if resolved_base_loss == "act_mse" and resolved_tail_source != "activation":
+            raise ValueError(
+                "transform_search objective jtail with base_loss=act_mse requires "
+                "--transform_search_tail_source activation."
+            )
+        if resolved_tail_source == "activation" and resolved_base_loss not in {"cov", "act_mse"}:
+            raise ValueError(
+                "transform_search tail_source=activation only supports "
+                "base_loss in {cov, act_mse}."
+            )
 
     if resolved_base_loss == "cov" and not has_group_covariances:
         raise ValueError(
             "transform_search objective requires group_covariances, but they are unavailable."
         )
+    return resolved_objective, resolved_base_loss, resolved_tail_source
+
+
+def resolve_transform_search_objective(
+    objective: str,
+    base_loss: str,
+    has_group_covariances: bool,
+    auto_default: str,
+) -> tuple[str, str]:
+    resolved_objective, resolved_base_loss, _ = resolve_transform_search_config(
+        objective=objective,
+        base_loss=base_loss,
+        tail_source="weight",
+        has_group_covariances=has_group_covariances,
+        auto_default=auto_default,
+    )
     return resolved_objective, resolved_base_loss
 
 
@@ -330,12 +491,13 @@ def format_transform_search_objective(
     base_loss: str,
     tail_lambda: float,
     tail_bins: int,
+    tail_source: str = "weight",
     tail_weight_mode: str = "mixed_uniform",
     tail_weight_power: float = 2.0,
 ) -> str:
     if objective == "jtail":
         return (
-            f"J_tail(base={base_loss},lambda={tail_lambda:.3g},bins={tail_bins},"
+            f"J_tail(base={base_loss},tail={tail_source},lambda={tail_lambda:.3g},bins={tail_bins},"
             f"weights={tail_weight_mode},power={tail_weight_power:.3g})"
         )
     return objective
@@ -349,8 +511,11 @@ def search_best_group_transform(
     candidates: Sequence[str],
     device: torch.device,
     group_covariances: Sequence[torch.Tensor] | None = None,
+    act_quantizer_kwargs: dict[str, Any] | None = None,
+    slot_input_samples: torch.Tensor | None = None,
     objective: str = "mse",
     base_loss: str = "mse",
+    tail_source: str = "weight",
     tail_lambda: float = 0.0,
     tail_bins: int = 4,
     tail_weight_mode: str = "mixed_uniform",
@@ -383,22 +548,45 @@ def search_best_group_transform(
             f"Supported: {sorted(SUPPORTED_TAIL_WEIGHT_MODES)}"
         )
 
-    resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+    resolved_objective, resolved_base_loss, resolved_tail_source = resolve_transform_search_config(
         objective=objective,
         base_loss=base_loss,
+        tail_source=tail_source,
         has_group_covariances=has_group_covariances,
         auto_default=auto_default_objective,
     )
+    needs_activation_inputs = resolved_objective == "act_mse" or (
+        resolved_objective == "jtail" and (resolved_base_loss == "act_mse" or resolved_tail_source == "activation")
+    )
+    if needs_activation_inputs:
+        if act_quantizer_kwargs is None:
+            raise ValueError("Activation-based transform_search path requires activation quantizer kwargs.")
+        if slot_input_samples is None:
+            raise ValueError("Activation-based transform_search path requires slot_input_samples.")
+        if slot_input_samples.ndim != 2:
+            raise ValueError("slot_input_samples must have shape [num_rows, in_features].")
+        if slot_input_samples.shape[-1] != in_features:
+            raise ValueError(
+                f"slot_input_samples feature dim mismatch: got {slot_input_samples.shape[-1]}, "
+                f"expected {in_features}."
+            )
+        if slot_input_samples.shape[0] <= 0:
+            raise ValueError("slot_input_samples must contain at least one sample row.")
 
     candidates = _validate_candidates(candidates)
     if len(candidates) == 0:
         raise ValueError("candidates must contain at least one transform class.")
 
-    # Precompute candidate forward/backward matrices once per search.
+    # Precompute fixed candidate matrices once per search. Adaptive candidates are
+    # materialized inside the group loop from local weight/activation statistics.
     candidate_forward: dict[str, torch.Tensor] = {}
     candidate_backward: dict[str, torch.Tensor] = {}
     active_candidates: list[str] = []
     for name in candidates:
+        if name in ADAPTIVE_GROUP_TRANSFORMS:
+            active_candidates.append(name)
+            continue
+
         try:
             transform = build_transform(name, size=group_size, group_size=group_size, device=device, dtype=torch.float32)
             forward_matrix, backward_matrix_from_transform = get_transform_matrices(
@@ -448,21 +636,77 @@ def search_best_group_transform(
 
         best_name = active_candidates[0]
         best_error = float("inf")
+        group_inputs = None
+        if needs_activation_inputs:
+            group_inputs = slot_input_samples[:, start:end].to(device=device, dtype=torch.float32)
+
+        group_candidate_forward: dict[str, torch.Tensor] = {}
+        group_candidate_backward: dict[str, torch.Tensor] = {}
+        if "householder" in active_candidates:
+            householder_matrix = _build_adaptive_householder_for_group(
+                weights=weights,
+                start=start,
+                end=end,
+                device=device,
+                resolved_objective=resolved_objective,
+                resolved_base_loss=resolved_base_loss,
+                resolved_tail_source=resolved_tail_source,
+                group_covariances=group_covariances,
+                group_idx=group_idx,
+                group_inputs=group_inputs,
+            )
+            # Householder reflections are orthogonal and symmetric, so T^{-T}=T.
+            group_candidate_forward["householder"] = householder_matrix
+            group_candidate_backward["householder"] = householder_matrix
 
         # New: when mode=auto_abm, classify this group block into A/B/mixed before candidate scoring.
         group_tail_weight_mode = tail_weight_mode
         if resolved_objective == "jtail" and tail_weight_mode == "auto_abm":
-            group_weights_for_mode = [w[:, start:end].to(torch.float32) for w in weights]
-            group_tail_weight_mode = _select_tail_weight_mode_for_group(group_weights_for_mode)
+            if resolved_tail_source == "activation" and group_inputs is not None:
+                group_tail_weight_mode = _select_tail_weight_mode_for_group([group_inputs])
+            else:
+                group_weights_for_mode = [w[:, start:end].to(torch.float32) for w in weights]
+                group_tail_weight_mode = _select_tail_weight_mode_for_group(group_weights_for_mode)
 
         for name in active_candidates:
             total_error = 0.0
-            inv_t_matrix = candidate_backward[name]
-            forward_matrix = candidate_forward[name]
+            if name in group_candidate_forward:
+                inv_t_matrix = group_candidate_backward[name]
+                forward_matrix = group_candidate_forward[name]
+            else:
+                inv_t_matrix = candidate_backward[name]
+                forward_matrix = candidate_forward[name]
+            rotated_inputs = None
+            delta_x = None
+            if needs_activation_inputs:
+                rotated_inputs = group_inputs.matmul(forward_matrix)
+                delta_x = _compute_quantization_delta(rotated_inputs, act_quantizer_kwargs)
+
+            if resolved_objective == "act_mse":
+                total_error = delta_x.pow(2).mean().item()
+                if total_error < best_error:
+                    best_error = total_error
+                    best_name = name
+                continue
+
+            if resolved_objective == "jtail" and resolved_base_loss == "act_mse":
+                base_error = delta_x.pow(2).mean().item()
+                tail_error = _compute_tail_quantile_error(
+                    delta=delta_x,
+                    reference_tensor=rotated_inputs,
+                    tail_bins=tail_bins,
+                    tail_weight_mode=group_tail_weight_mode,
+                    tail_weight_power=tail_weight_power,
+                )
+                total_error = base_error + tail_lambda * tail_error
+                if total_error < best_error:
+                    best_error = total_error
+                    best_name = name
+                continue
 
             # Aggregate score over all layers that share this transform slot.
             for weight_idx, weight in enumerate(weights):
-                group_weight = weight[:, start:end].to(torch.float32)
+                group_weight = weight[:, start:end].to(device=device, dtype=torch.float32)
                 rotated_group = group_weight.matmul(inv_t_matrix)
 
                 delta_w = _compute_quantization_delta(rotated_group, quantizer_kwargs)
@@ -480,7 +724,7 @@ def search_best_group_transform(
                 #     )
                 if resolved_base_loss == "mse":
                     base_error = delta_w.pow(2).mean().item()
-                else:
+                elif resolved_base_loss == "cov":
                     base_covariance = group_covariances[weight_idx][group_idx].to(device=device, dtype=torch.float32)
                     # Because activation is transformed as x' = xT, covariance becomes Cov' = T^T Cov T.
                     rotated_covariance = forward_matrix.transpose(-1, -2).matmul(base_covariance).matmul(forward_matrix)
@@ -490,26 +734,44 @@ def search_best_group_transform(
                         rotated_group_covariance=rotated_covariance,
                         delta_w=delta_w,
                     )
+                else:
+                    raise ValueError(f"Unsupported resolved_base_loss '{resolved_base_loss}' for weight-domain scoring.")
 
                 if resolved_objective == "jtail":
-                    tail_error = _compute_tail_quantile_error(
-                        delta_w=delta_w,
-                        reference_weight=rotated_group,
-                        tail_bins=tail_bins,
-                        tail_weight_mode=group_tail_weight_mode,
-                        tail_weight_power=tail_weight_power,
-                    )
-                    total_error += base_error + tail_lambda * tail_error
+                    total_error += base_error
+                    if resolved_tail_source == "weight":
+                        tail_error = _compute_tail_quantile_error(
+                            delta=delta_w,
+                            reference_tensor=rotated_group,
+                            tail_bins=tail_bins,
+                            tail_weight_mode=group_tail_weight_mode,
+                            tail_weight_power=tail_weight_power,
+                        )
+                        total_error += tail_lambda * tail_error
                 else:
                     total_error += base_error
+
+            if resolved_objective == "jtail" and resolved_tail_source == "activation":
+                tail_error = _compute_tail_quantile_error(
+                    delta=delta_x,
+                    reference_tensor=rotated_inputs,
+                    tail_bins=tail_bins,
+                    tail_weight_mode=group_tail_weight_mode,
+                    tail_weight_power=tail_weight_power,
+                )
+                total_error += tail_lambda * tail_error
 
             if total_error < best_error:
                 best_error = total_error
                 best_name = name
 
         selected_names.append(best_name)
-        selected_forward.append(candidate_forward[best_name])
-        selected_backward.append(candidate_backward[best_name])
+        if best_name in group_candidate_forward:
+            selected_forward.append(group_candidate_forward[best_name])
+            selected_backward.append(group_candidate_backward[best_name])
+        else:
+            selected_forward.append(candidate_forward[best_name])
+            selected_backward.append(candidate_backward[best_name])
         if selected_tail_weight_modes is not None:
             selected_tail_weight_modes.append(group_tail_weight_mode)
 
@@ -531,7 +793,9 @@ def build_block_input_transforms(
     device: torch.device,
     transform_kwargs: dict[str, Any],
     weight_quantizer_kwargs: dict[str, Any] | None,
+    act_quantizer_kwargs: dict[str, Any] | None = None,
     slot_input_covariances: dict[str, torch.Tensor] | None = None,
+    slot_input_samples: dict[str, torch.Tensor] | None = None,
     auto_default_objective: str = "mse",
 ):
     # Original non-search path preserved.
@@ -549,12 +813,28 @@ def build_block_input_transforms(
 
     candidates = getattr(args, "transform_search_candidates", DEFAULT_SEARCH_TRANSFORMS)
     group_size = args.w_group_size
-    resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+    resolved_objective, resolved_base_loss, resolved_tail_source = resolve_transform_search_config(
         objective=getattr(args, "transform_search_objective", "auto"),
         base_loss=getattr(args, "transform_search_base_loss", "cov"),
+        tail_source=getattr(args, "transform_search_tail_source", "weight"),
         has_group_covariances=slot_input_covariances is not None,
         auto_default=auto_default_objective,
     )
+    needs_activation_inputs = resolved_objective == "act_mse" or (
+        resolved_objective == "jtail" and (resolved_base_loss == "act_mse" or resolved_tail_source == "activation")
+    )
+    if needs_activation_inputs:
+        if act_quantizer_kwargs is None:
+            raise ValueError(
+                "transform_search activation-based path requires activation quantization (a_bits < 16)."
+            )
+        if args.a_granularity != "group" or args.a_group_size != group_size:
+            raise ValueError(
+                "transform_search activation-based path currently requires "
+                "--a_granularity group and --a_group_size equal to --w_group_size."
+            )
+        if slot_input_samples is None:
+            raise ValueError("transform_search activation-based path requires collected slot input samples.")
     tail_lambda = float(getattr(args, "transform_search_tail_lambda", 0.0))
     tail_bins = int(getattr(args, "transform_search_tail_bins", 4))
     tail_weight_mode = str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform"))
@@ -571,8 +851,11 @@ def build_block_input_transforms(
             [slot_input_covariances["qkv"], slot_input_covariances["qkv"], slot_input_covariances["qkv"]]
             if slot_input_covariances is not None else None
         ),
+        act_quantizer_kwargs=act_quantizer_kwargs,
+        slot_input_samples=(slot_input_samples["qkv"] if slot_input_samples is not None else None),
         objective=resolved_objective,
         base_loss=resolved_base_loss,
+        tail_source=(resolved_tail_source or "weight"),
         tail_lambda=tail_lambda,
         tail_bins=tail_bins,
         tail_weight_mode=tail_weight_mode,
@@ -588,8 +871,11 @@ def build_block_input_transforms(
         candidates=candidates,
         device=device,
         group_covariances=([slot_input_covariances["o"]] if slot_input_covariances is not None else None),
+        act_quantizer_kwargs=act_quantizer_kwargs,
+        slot_input_samples=(slot_input_samples["o"] if slot_input_samples is not None else None),
         objective=resolved_objective,
         base_loss=resolved_base_loss,
+        tail_source=(resolved_tail_source or "weight"),
         tail_lambda=tail_lambda,
         tail_bins=tail_bins,
         tail_weight_mode=tail_weight_mode,
@@ -608,8 +894,11 @@ def build_block_input_transforms(
             [slot_input_covariances["gate_up"], slot_input_covariances["gate_up"]]
             if slot_input_covariances is not None else None
         ),
+        act_quantizer_kwargs=act_quantizer_kwargs,
+        slot_input_samples=(slot_input_samples["gate_up"] if slot_input_samples is not None else None),
         objective=resolved_objective,
         base_loss=resolved_base_loss,
+        tail_source=(resolved_tail_source or "weight"),
         tail_lambda=tail_lambda,
         tail_bins=tail_bins,
         tail_weight_mode=tail_weight_mode,
@@ -625,8 +914,11 @@ def build_block_input_transforms(
         candidates=candidates,
         device=device,
         group_covariances=([slot_input_covariances["down"]] if slot_input_covariances is not None else None),
+        act_quantizer_kwargs=act_quantizer_kwargs,
+        slot_input_samples=(slot_input_samples["down"] if slot_input_samples is not None else None),
         objective=resolved_objective,
         base_loss=resolved_base_loss,
+        tail_source=(resolved_tail_source or "weight"),
         tail_lambda=tail_lambda,
         tail_bins=tail_bins,
         tail_weight_mode=tail_weight_mode,

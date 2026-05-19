@@ -98,30 +98,10 @@ MAX_EXPERIMENTS="${MAX_EXPERIMENTS:-0}"
 RUN_COUNT=0
 
 ###############################################################################
-# 5) Target matrix (this script is intentionally narrow)
+# 5) Fixed rerun targets (only 3 experiments)
 ###############################################################################
-# Re-run all RTN + mse for these formats.
-if [[ -z "${FORMATS+x}" ]]; then
-  FORMATS=(nvfp mxfp)
-fi
-
-# RTN objective list (keep aligned with your current policy).
-if [[ -z "${SEARCH_OBJECTIVES_RTN+x}" ]]; then
-  SEARCH_OBJECTIVES_RTN=(auto cov)
-fi
-
-# Candidates list
 if [[ -z "${SEARCH_CANDIDATES+x}" ]]; then
   SEARCH_CANDIDATES=(identity hadamard dct dst gsr householder)
-fi
-
-# GPTQ+mse sample probes (1-2 recommended). Default: exactly 2 probes.
-# Format: "fmt:objective:order"
-if [[ -z "${GPTQ_SAMPLE_TARGETS+x}" ]]; then
-  GPTQ_SAMPLE_TARGETS=(
-    "nvfp:auto:default"
-    "mxfp:auto:default"
-  )
 fi
 
 INCLUDE_FAST_FOOD="${INCLUDE_FAST_FOOD:-0}"
@@ -129,8 +109,15 @@ if [[ "${INCLUDE_FAST_FOOD}" == "1" ]]; then
   SEARCH_CANDIDATES+=("fast_food")
 fi
 
+# Exactly 1 experiments:
+# name:format:method:objective:order
+RERUN_TARGETS=(
+  "nvfp_gptq_search_auto_mse_default:nvfp:gptq:auto:default"
+)
+
 # Avoid clobbering old outputs by default.
 NAME_SUFFIX="${NAME_SUFFIX:-_rerun_msefix}"
+
 
 ###############################################################################
 # 6) Pre-check: lm_eval import is required by model_quant.py top-level imports
@@ -277,7 +264,7 @@ run_or_continue () {
 }
 
 ###############################################################################
-# 9) Scheduling
+# 9) Scheduling (fixed 3 runs only)
 ###############################################################################
 echo "[INFO] MODEL_DIR=${MODEL_DIR}"
 echo "[INFO] CALIB_DATASET=${CALIB_DATASET}"
@@ -285,44 +272,34 @@ echo "[INFO] OUT_ROOT=${OUT_ROOT}/${MODEL_ID}"
 echo "[INFO] LOG_DIR=${LOG_DIR}"
 echo "[INFO] EXPORT_MODE=${EXPORT_MODE}"
 echo "[INFO] SEARCH_CANDIDATES=${SEARCH_CANDIDATES[*]}"
-echo "[INFO] SEARCH_OBJECTIVES_RTN=${SEARCH_OBJECTIVES_RTN[*]}"
-echo "[INFO] GPTQ_SAMPLE_TARGETS=${GPTQ_SAMPLE_TARGETS[*]}"
+echo "[INFO] RERUN_TARGETS=${RERUN_TARGETS[*]}"
 echo "[INFO] NAME_SUFFIX=${NAME_SUFFIX}"
 echo
 
 STOP_ALL=0
 
-# A) Re-run all RTN + w_observer=mse
-for fmt in "${FORMATS[@]}"; do
-  for objective in "${SEARCH_OBJECTIVES_RTN[@]}"; do
-    name="${fmt}_rtn_search_${objective}_mse_default"
-    run_or_continue "${name}" "${fmt}" \
-      --transform_class identity \
-      --w_observer mse \
-      --quantization_order default \
-      --transform_search \
-      --transform_search_candidates "${SEARCH_CANDIDATES[@]}" \
-      --transform_search_objective "${objective}" || STOP_ALL=$?
-    [[ "${STOP_ALL}" -eq 2 ]] && break 2
-  done
-done
+for target in "${RERUN_TARGETS[@]}"; do
+  IFS=':' read -r name fmt method objective order <<< "${target}"
 
-# B) GPTQ + mse spot-checks (1-2 recommended; default 2)
-for target in "${GPTQ_SAMPLE_TARGETS[@]}"; do
-  IFS=':' read -r fmt objective order <<< "${target}"
-  if [[ -z "${fmt}" || -z "${objective}" || -z "${order}" ]]; then
-    echo "[WARN] Invalid GPTQ sample target: ${target}"
-    continue
+  if [[ "${fmt}" == "nvfp" ]]; then
+    hgs_search=16
+  else
+    hgs_search=32
   fi
-  name="${fmt}_gptq_search_${objective}_mse_${order}_sample"
+
+  extra=()
+  [[ "${method}" == "gptq" ]] && extra+=(--gptq)
+
   run_or_continue "${name}" "${fmt}" \
-    --gptq \
     --transform_class identity \
+    --hadamard_group_size "${hgs_search}" \
     --w_observer mse \
     --quantization_order "${order}" \
     --transform_search \
     --transform_search_candidates "${SEARCH_CANDIDATES[@]}" \
-    --transform_search_objective "${objective}" || STOP_ALL=$?
+    --transform_search_objective "${objective}" \
+    "${extra[@]}" || STOP_ALL=$?
+
   [[ "${STOP_ALL}" -eq 2 ]] && break
 done
 
@@ -333,4 +310,5 @@ echo "Outputs           : ${OUT_ROOT}/${MODEL_ID}/"
 echo "Logs              : ${LOG_DIR}/"
 echo "Done list         : ${DONE_LIST}"
 echo "Failed list       : ${FAILED_LIST}"
+
 

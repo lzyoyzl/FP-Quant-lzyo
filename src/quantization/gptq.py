@@ -22,7 +22,8 @@ from .transform_search import (
     format_transform_summary,
     get_export_transform_matrices,
     should_collect_group_covariances,
-    resolve_transform_search_objective,
+    should_collect_input_samples,
+    resolve_transform_search_config,
     format_transform_search_objective,
 )
 from ..utils.linalg_utils import inv_sym
@@ -72,6 +73,47 @@ def _finalize_group_covariance_stats(stats: dict) -> torch.Tensor:
     return covariance
 
 
+def _subsample_rows(x: torch.Tensor, max_rows: int) -> torch.Tensor:
+    if max_rows <= 0:
+        return x[:0]
+    if x.shape[0] <= max_rows:
+        return x
+    step = x.shape[0] / float(max_rows)
+    indices = torch.floor(torch.arange(max_rows, device=x.device, dtype=torch.float32) * step).long()
+    indices = indices.clamp_max(x.shape[0] - 1)
+    return x.index_select(0, indices)
+
+
+def _init_slot_input_sample_stats(in_features: int, max_rows: int):
+    return {
+        "in_features": in_features,
+        "max_rows": max_rows,
+        "samples": None,
+    }
+
+
+@torch.no_grad()
+def _update_slot_input_sample_stats(stats: dict, layer_input: torch.Tensor):
+    max_rows = stats["max_rows"]
+    if max_rows <= 0:
+        return
+    x = layer_input.detach().to(torch.float32).reshape(-1, layer_input.shape[-1])
+    if x.numel() == 0:
+        return
+    x = _subsample_rows(x, max_rows).to(device="cpu", dtype=torch.float16)
+    if stats["samples"] is None:
+        stats["samples"] = x
+    else:
+        stats["samples"] = _subsample_rows(torch.cat([stats["samples"], x], dim=0), max_rows).contiguous()
+
+
+@torch.no_grad()
+def _finalize_slot_input_sample_stats(stats: dict) -> torch.Tensor:
+    if stats["samples"] is None:
+        return torch.empty((0, stats["in_features"]), dtype=torch.float16)
+    return stats["samples"].contiguous()
+
+
 @torch.no_grad()
 def collect_block_slot_input_covariances(
     block: nn.Module,
@@ -116,6 +158,54 @@ def collect_block_slot_input_covariances(
             hook.remove()
 
     return {slot_name: _finalize_group_covariance_stats(stats) for slot_name, stats in slot_stats.items()}
+
+
+@torch.no_grad()
+def collect_block_slot_input_samples(
+    block: nn.Module,
+    input_args: list,
+    input_kwargs: list,
+    max_rows: int,
+    device: torch.device,
+    amp_enabled: bool,
+) -> dict[str, torch.Tensor]:
+    """
+    Collect a capped set of per-slot input rows from calibration inputs.
+
+    The returned samples are stored on CPU and later sliced group-by-group by the
+    act_mse transform-search objective.
+    """
+    slot_stats = {
+        "qkv": _init_slot_input_sample_stats(block.self_attn.q_proj.weight.shape[-1], max_rows),
+        "o": _init_slot_input_sample_stats(block.self_attn.o_proj.weight.shape[-1], max_rows),
+        "gate_up": _init_slot_input_sample_stats(block.mlp.gate_proj.weight.shape[-1], max_rows),
+        "down": _init_slot_input_sample_stats(block.mlp.down_proj.weight.shape[-1], max_rows),
+    }
+
+    def make_sample_hook(slot_name: str):
+        def _hook(_, inp, out):
+            if len(inp) == 0:
+                return
+            _update_slot_input_sample_stats(slot_stats[slot_name], inp[0])
+        return _hook
+
+    hooks = [
+        block.self_attn.q_proj.register_forward_hook(make_sample_hook("qkv")),
+        block.self_attn.o_proj.register_forward_hook(make_sample_hook("o")),
+        block.mlp.gate_proj.register_forward_hook(make_sample_hook("gate_up")),
+        block.mlp.down_proj.register_forward_hook(make_sample_hook("down")),
+    ]
+
+    device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+    try:
+        for cur_args, cur_kwargs in zip(input_args, input_kwargs):
+            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=amp_enabled):
+                block(*to(cur_args, device=device), **to(cur_kwargs, device=device))
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    return {slot_name: _finalize_slot_input_sample_stats(stats) for slot_name, stats in slot_stats.items()}
 
 
 class GPTQ:
@@ -394,11 +484,19 @@ def gptq_quantization(
         # )
         # New objective path: search objective is configurable (mse / cov / J_tail).
         slot_input_covariances = None
+        slot_input_samples = None
         collect_covariances = False
+        collect_input_samples = False
         if args.transform_search:
             collect_covariances = should_collect_group_covariances(
                 objective=getattr(args, "transform_search_objective", "auto"),
                 base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                auto_default="cov",
+            )
+            collect_input_samples = should_collect_input_samples(
+                objective=getattr(args, "transform_search_objective", "auto"),
+                base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                tail_source=getattr(args, "transform_search_tail_source", "weight"),
                 auto_default="cov",
             )
             if collect_covariances:
@@ -407,6 +505,15 @@ def gptq_quantization(
                     input_args=input_args,
                     input_kwargs=input_kwargs,
                     group_size=args.w_group_size,
+                    device=device,
+                    amp_enabled=args.amp,
+                )
+            if collect_input_samples:
+                slot_input_samples = collect_block_slot_input_samples(
+                    block=block,
+                    input_args=input_args,
+                    input_kwargs=input_kwargs,
+                    max_rows=int(getattr(args, "transform_search_act_sample_size", 1024)),
                     device=device,
                     amp_enabled=args.amp,
                 )
@@ -419,13 +526,16 @@ def gptq_quantization(
             device=device,
             transform_kwargs=transform_kwargs,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
+            act_quantizer_kwargs=act_quantizer_kwargs,
             slot_input_covariances=slot_input_covariances,
+            slot_input_samples=slot_input_samples,
             auto_default_objective="cov",
         )
         if args.transform_search:
-            resolved_objective, resolved_base_loss = resolve_transform_search_objective(
+            resolved_objective, resolved_base_loss, resolved_tail_source = resolve_transform_search_config(
                 objective=getattr(args, "transform_search_objective", "auto"),
                 base_loss=getattr(args, "transform_search_base_loss", "cov"),
+                tail_source=getattr(args, "transform_search_tail_source", "weight"),
                 has_group_covariances=slot_input_covariances is not None,
                 auto_default="cov",
             )
@@ -434,6 +544,7 @@ def gptq_quantization(
                 base_loss=resolved_base_loss,
                 tail_lambda=float(getattr(args, "transform_search_tail_lambda", 0.0)),
                 tail_bins=int(getattr(args, "transform_search_tail_bins", 4)),
+                tail_source=(resolved_tail_source or "weight"),
                 tail_weight_mode=str(getattr(args, "transform_search_tail_weight_mode", "mixed_uniform")),
                 tail_weight_power=float(getattr(args, "transform_search_tail_weight_power", 2.0)),
             )
@@ -446,9 +557,19 @@ def gptq_quantization(
                     f"gate_up={slot_input_covariances['gate_up'].shape[0]},"
                     f"down={slot_input_covariances['down'].shape[0]})"
                 )
+            if slot_input_samples is None:
+                act_tag = "disabled"
+            else:
+                act_tag = (
+                    f"enabled(qkv={slot_input_samples['qkv'].shape[0]},"
+                    f"o={slot_input_samples['o'].shape[0]},"
+                    f"gate_up={slot_input_samples['gate_up'].shape[0]},"
+                    f"down={slot_input_samples['down'].shape[0]})"
+                )
             print(
                 f"  [transform_search] objective={objective_tag} | "
                 f"group_covariances={cov_tag} | "
+                f"act_samples={act_tag} | "
                 f"qkv={format_transform_summary(qkv_in_transform)} | "
                 f"o={format_transform_summary(o_in_transform)} | "
                 f"gate_up={format_transform_summary(gate_up_in_transform)} | "

@@ -21,6 +21,7 @@ from src.quantization.transform_search import (
     SUPPORTED_SEARCH_TRANSFORMS,
     SUPPORTED_SEARCH_OBJECTIVES,
     SUPPORTED_SEARCH_BASE_LOSSES,
+    SUPPORTED_TAIL_SOURCES,
     SUPPORTED_TAIL_WEIGHT_MODES,
 )
 from src.utils.common_utils import fix_seed
@@ -285,7 +286,7 @@ def parse_args():
         type=str,
         default="auto",
         choices=sorted(SUPPORTED_SEARCH_OBJECTIVES),
-        help="Transform-search objective: auto/mse/cov/jtail.",
+        help="Transform-search objective: auto/mse/cov/act_mse/jtail.",
     )
     parser.add_argument(
         "--transform_search_base_loss",
@@ -293,6 +294,13 @@ def parse_args():
         default="cov",
         choices=sorted(SUPPORTED_SEARCH_BASE_LOSSES),
         help="Base loss L(T) used when objective=jtail.",
+    )
+    parser.add_argument(
+        "--transform_search_tail_source",
+        type=str,
+        default="weight",
+        choices=sorted(SUPPORTED_TAIL_SOURCES),
+        help="Tail source used when objective=jtail: weight or activation.",
     )
     parser.add_argument(
         "--transform_search_tail_lambda",
@@ -318,6 +326,12 @@ def parse_args():
         type=float,
         default=2.0,
         help="Shape parameter for tail-bin weight profile (>0).",
+    )
+    parser.add_argument(
+        "--transform_search_act_sample_size",
+        type=int,
+        default=1024,
+        help="Maximum number of calibration rows cached per slot for objective=act_mse.",
     )
     # Logging params
     parser.add_argument(
@@ -428,11 +442,33 @@ def parse_args():
                 f"Invalid --transform_search_base_loss: {args.transform_search_base_loss}. "
                 f"Supported: {sorted(SUPPORTED_SEARCH_BASE_LOSSES)}"
             )
+        if args.transform_search_tail_source not in SUPPORTED_TAIL_SOURCES:
+            raise ValueError(
+                f"Invalid --transform_search_tail_source: {args.transform_search_tail_source}. "
+                f"Supported: {sorted(SUPPORTED_TAIL_SOURCES)}"
+            )
         if args.transform_search_tail_weight_mode not in SUPPORTED_TAIL_WEIGHT_MODES:
             raise ValueError(
                 f"Invalid --transform_search_tail_weight_mode: {args.transform_search_tail_weight_mode}. "
                 f"Supported: {sorted(SUPPORTED_TAIL_WEIGHT_MODES)}"
             )
+        if args.transform_search_act_sample_size <= 0:
+            raise ValueError("--transform_search_act_sample_size must be > 0.")
+
+        if args.transform_search_objective == "jtail":
+            if args.transform_search_base_loss == "act_mse" and args.transform_search_tail_source != "activation":
+                raise ValueError(
+                    "objective=jtail with base_loss=act_mse requires "
+                    "--transform_search_tail_source activation."
+                )
+            if (
+                args.transform_search_tail_source == "activation"
+                and args.transform_search_base_loss not in {"cov", "act_mse"}
+            ):
+                raise ValueError(
+                    "objective=jtail with tail_source=activation only supports "
+                    "base_loss in {cov, act_mse}."
+                )
 
         # Deduplicate while preserving order so search behavior is deterministic.
         dedup_candidates = []
